@@ -1,0 +1,38 @@
+# 管制室のリバースプロキシ (VMの /etc/caddy/Caddyfile に配置。git管理はこのファイルが正)
+# - nip.io: ドメインが無くても使える暫定URL
+# - fragment.example.com: 管制室のホスト。DNSが解決可能になった時点でCaddyが自動でLet's Encrypt証明書を取得する
+#   (それまでは取得リトライのログが出るが、他ホストの動作には影響しない)
+
+# ⚠ header_up を明示しないと Next.js/next-auth が自分のホストを localhost:3000 だと誤認する。
+#    症状: ログインの callbackUrl が https://localhost:3000/ になり認証後に戻れない／
+#          アカウントカードが「ローカル開発 (localhost)」表示になる。
+#    2026-07-26の認証バイパス事故(公開URLでlocalhost判定が成立して管制室が丸見え)と同じ根本原因。
+#    あの時は判定側を NODE_ENV に変えて塞いだが、Hostヘッダー自体は直していなかった (2026-07-30に修正)
+(dashboard) {
+    reverse_proxy localhost:3000 {
+        header_up Host {host}
+        header_up X-Forwarded-Host {host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote_host}
+    }
+}
+
+203-0-113-10.nip.io {
+    import dashboard
+}
+
+fragment.example.com {
+    import dashboard
+}
+
+# ⚠ LiveKit を TLS で出すのは必須 (2026-07-30に半日溶かした)。
+#    管制室がHTTPSなので、ブラウザは平文の ws://203.0.113.10:7880 に繋げない
+#    (SecurityError: insecure WebSocket ... from a page loaded over HTTPS)。
+#    その結果ブラウザがルームに参加できず、通話画面を開いても参加者は agent と sip だけ、
+#    双方向とも無音になる。文字起こしはDB経由で出るので「音だけ出ない」ように見えて紛らわしい。
+#    ここを通したうえで .env の LIVEKIT_PUBLIC_URL=wss://livekit.example.com を設定する。
+#    メディア(WebRTC)はこのプロキシを通らず UDP 50000-50100 で直接VMへ来る
+#    (firewall `call-agent-webrtc` で開放済み・livekit.yaml の use_external_ip=true で公開IPを広告)
+livekit.example.com {
+    reverse_proxy localhost:7880
+}

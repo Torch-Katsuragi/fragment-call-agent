@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">フラグメント</string>
+    <string name="account_description">フラグメントの通話</string>
+    <string name="setup_title">接続先の設定</string>
+</resources>

@@ -1,0 +1,267 @@
+; pjsip.conf.template — Render-Config.ps1 が ../.env の値を埋めて pjsip.conf を生成する
+; (生成後の pjsip.conf は SIP 認証情報を含むため .gitignore 対象。git 管理はこのテンプレのみ)
+
+[global]
+type=global
+; ブラステルはSIPメッセージのサイズ上限が厳しく、認証付きINVITE (約1.2KB) が
+; 「513 Message too large」で弾かれる (2026-07-19実測)。コンパクトヘッダ+短いUAで削る
+user_agent=ca
+compact_headers=yes
+
+[system]
+type=system
+; ⚠INVITEの再送を止めるためにT1を延ばす (2026-07-31)。
+; 症状: 1本の着信で**通話が二重に立ち**、片方が9秒で死ぬ (管制室に通話カードが2枚並ぶ)。
+;   死んだ方に管制室が入ると無音になるので実害がある。
+; 原因: LiveKit SIP の応答が既定のT1(500ms)を超えて遅れることがあり、Asteriskが
+;   INVITEを再送 → **LiveKit SIP が再送を新規呼として扱って部屋を2つ作る**。
+;   Asterisk側はダイヤルプランを1回しか通っておらず (実測) 二重にかけてはいない。
+;   同じ SIP Call-ID で部屋が2つできることで確認した。
+; ⚠2026-07-30に直した `rewrite_contact` は**200 OKへのACKの宛先**の問題で、こちらは
+;   その手前のINVITE再送。層が違うので、あの修正が効いていても再発する。
+; 対処: ループバック(127.0.0.1)宛にパケットロスは起きないので、この区間の再送は
+;   利益ゼロで害だけ。T1を2秒に延ばせばLiveKitが多少もたついても再送しない。
+; ⚠副作用: T1はグローバル設定でブラステル/Twilio側にも効く。**本当にパケットが落ちた
+;   時の再送が0.5秒→2秒に遅くなる**。外部区間は相手側も再送するので許容と判断した。
+; ⚠起動のたびに出る警告は**正常**。消そうとしないこと (2026-07-31に確認):
+;     WARNING res_pjsip/config_system.c: Timer B setting is too low. Setting to 128000
+;   timer_b の**既定値が32000**で、T1を上げると既定値の方が 64*T1 を下回るため、
+;   **timer_b を書いても書かなくても出る**。64*T1未満は RFC3261 の規定で許されない。
+;   結果として失敗検知は128秒に伸びるが、実害は小さい —
+;   LiveKitへの Dial は30秒、発信の Originate は40秒で切れるので**アプリ側の
+;   タイムアウトが先に効き**、Timer Bに到達する経路が実質ない。
+timer_t1=2000
+
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0:5070
+; 5060 は LiveKit SIP が使うため 5070 に退避 (host network 上での衝突回避)
+; NAT越え: 外部から見えるIPをSDP/Contactに書く (${PUBLIC_IP} は Render-Config.ps1 が実行時に自動取得)
+; ※local_net 宛て (同一ホストの LiveKit SIP 含む) には適用されない — 127.0.0.0/8 を忘れると
+;   localhost 通信まで公開IPを名乗ってヘアピンで全滅する (2026-07-15 に実際に踏んだ)
+external_media_address=${PUBLIC_IP}
+external_signaling_address=${PUBLIC_IP}
+local_net=127.0.0.0/8
+local_net=10.0.0.0/8
+local_net=172.16.0.0/12
+local_net=192.168.0.0/16
+; Tailscale (CGNAT帯 100.64.0.0/10)。ソフトフォン内線はこの経路でしか繋がない (2026-09-17)。
+; ⚠これを書かないと、tailnet の相手にも SDP/Contact で ${PUBLIC_IP} を名乗ってしまい、
+;   RTP が公開IP宛て (= FWで塞いである) に飛んで**発信者に音が届かない**。
+;   127.0.0.0/8 を忘れてヘアピンで全滅した 2026-07-15 と同じ型の事故になる
+local_net=100.64.0.0/10
+
+;=== ブラステル My050 (REGISTER 型・こちらから張りに行く) ===
+
+[brastel-registration]
+type=registration
+transport=transport-udp
+outbound_auth=brastel-auth
+server_uri=sip:${BRASTEL_SIP_SERVER}
+client_uri=sip:${BRASTEL_SIP_USER}@${BRASTEL_SIP_SERVER}
+contact_user=${BRASTEL_SIP_USER}
+retry_interval=60
+forbidden_retry_interval=300
+expiration=300
+line=yes
+endpoint=brastel
+
+[brastel-auth]
+type=auth
+auth_type=userpass
+username=${BRASTEL_SIP_USER}
+password=${BRASTEL_SIP_PASSWORD}
+
+[brastel-aor]
+type=aor
+contact=sip:${BRASTEL_SIP_SERVER}
+
+[brastel]
+type=endpoint
+transport=transport-udp
+context=from-brastel
+outbound_auth=brastel-auth
+aors=brastel-aor
+from_user=${BRASTEL_SIP_USER}
+from_domain=${BRASTEL_SIP_SERVER}
+disallow=all
+allow=ulaw
+allow=alaw
+; 発信INVITEのサイズ削減 (513対策): セッションタイマー・100rel・SDPのtelephone-event行を落とす。
+; DTMF送出が必要になったら dtmf_mode を rfc4733 に戻し、別の削減手段を探すこと
+timers=no
+100rel=no
+dtmf_mode=inband
+; --- NAT 裏 (自宅/ローカルPC) で動かす前提の設定 ---
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[brastel-identify]
+type=identify
+endpoint=brastel
+match=${BRASTEL_SIP_SERVER}
+
+;=== Twilio Elastic SIP Trunking (peer型・非REGISTER, 2026-07-21) ===
+; TwilioはREGISTERに非対応。発信(Termination)はCredential List認証でTwilioへ直接INVITE、
+; 着信(Origination)はTwilio側コンソールに登録した固定IP:5070へTwilioがINVITEを送ってくる。
+; そのため identify で送信元をTwilioのUS1 signaling帯に絞る (REGISTERがない分、ここで絞らないと
+; 誰でもendpoint=twilioを騙れてしまう)
+
+[twilio-auth]
+type=auth
+auth_type=userpass
+username=${TWILIO_SIP_USER}
+password=${TWILIO_SIP_PASSWORD}
+
+[twilio-aor]
+type=aor
+contact=sip:${TWILIO_TERMINATION_URI}
+
+[twilio]
+type=endpoint
+transport=transport-udp
+context=from-twilio
+outbound_auth=twilio-auth
+aors=twilio-aor
+from_user=${TWILIO_SIP_USER}
+from_domain=${TWILIO_TERMINATION_URI}
+disallow=all
+allow=ulaw
+allow=alaw
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[twilio-identify]
+type=identify
+endpoint=twilio
+; Twilio US1 SIP signaling range (2026-07-21確認: twilio.com/docs/sip-trunking/ip-addresses)
+; 他リージョンを使う場合や将来の変更に備え、疎通しない場合はこのドキュメントを再確認すること
+match=54.172.60.0/30
+
+;=== LiveKit SIP へのブリッジ先 (同一ホスト 127.0.0.1:5060) ===
+
+[livekit]
+type=endpoint
+transport=transport-udp
+context=from-livekit
+aors=livekit-aor
+disallow=all
+allow=ulaw
+allow=alaw
+direct_media=no
+; ⚠ rewrite_contact は必須 (2026-07-30に半日溶かした)。
+; LiveKit SIP は use_external_ip=false でも Contact/SDP に **ループバックではなく
+; 主NICのIP** (GCPなら 10.0.0.x) を名乗る。素直に従うと ACK の宛先がそこになり、
+; ACK の送信元IPまで 127.0.0.1 から 10.0.0.x に変わってしまう。すると LiveKit 側は
+; INVITE と送信元が違う ACK を対話に紐付けられず「no ACK received for 200 OK」で
+; 200 OK を再送し続け、呼が二重に立って片方が数秒で死ぬ。
+; rewrite_contact=yes で「受け取った Contact を実際の送信元アドレスに読み替える」ため、
+; 以後の ACK/BYE もループバック宛に揃う。ブラステル/Twilio には最初から付いていた。
+; ※AOR の contact を 10.0.0.4 側に寄せる案は失敗する (LiveKit がその宛先の
+;   INVITE に一切応答しない = 着信も全滅する。2026-07-30に実測)
+rewrite_contact=yes
+force_rport=yes
+rtp_symmetric=yes
+
+[livekit-aor]
+type=aor
+contact=sip:127.0.0.1:5060
+
+;=== ソフトフォン内線 (2026-09-17) ===
+; 「当面のIP電話体制」= AI応対の前に、普通の電話機として PC/スマホを鳴らすための内線。
+; 1001=PC親機 / 1002,1003=スマホ子機。着信は extensions.conf の [inbound-handler] で同時に鳴らす。
+;
+; ⚠**公開ポートは開けない。Tailscale 経由でのみ REGISTER する**。
+;   2026-07-26 に 5060 を公開していてSIPスキャナーの侵入とトールフラウドを踏んでいる。
+;   ソフトフォンは登録元IPが定まらないので identify で絞れず、公開すると同じ面が開く。
+;   GCPのFWは今もブラステル/TwilioのIPだけを通す設定のまま — それを崩さないための Tailscale。
+; ⚠外線発信は extensions.conf の [phones] 側で国際番号を落としている。
+;   認証情報が漏れても金銭被害にならない最後の防壁なので外さないこと。
+
+[phone-auth-1001]
+type=auth
+auth_type=userpass
+username=1001
+password=${PHONE_1001_PASSWORD}
+
+[1001]
+type=aor
+; 同じ内線を複数端末で受けたい場合があるので2まで許す (PC+予備)
+max_contacts=2
+remove_existing=yes
+; 落ちた端末を鳴らし続けないよう死活を見る
+qualify_frequency=60
+
+[1001]
+type=endpoint
+transport=transport-udp
+context=phones
+auth=phone-auth-1001
+aors=1001
+callerid=PC <1001>
+disallow=all
+allow=ulaw
+allow=alaw
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[phone-auth-1002]
+type=auth
+auth_type=userpass
+username=1002
+password=${PHONE_1002_PASSWORD}
+
+[1002]
+type=aor
+max_contacts=2
+remove_existing=yes
+qualify_frequency=60
+
+[1002]
+type=endpoint
+transport=transport-udp
+context=phones
+auth=phone-auth-1002
+aors=1002
+callerid=Mobile1 <1002>
+disallow=all
+allow=ulaw
+allow=alaw
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[phone-auth-1003]
+type=auth
+auth_type=userpass
+username=1003
+password=${PHONE_1003_PASSWORD}
+
+[1003]
+type=aor
+max_contacts=2
+remove_existing=yes
+qualify_frequency=60
+
+[1003]
+type=endpoint
+transport=transport-udp
+context=phones
+auth=phone-auth-1003
+aors=1003
+callerid=Mobile2 <1003>
+disallow=all
+allow=ulaw
+allow=alaw
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes

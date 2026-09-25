@@ -1,0 +1,17 @@
+# 2026-09-18: 1.6.5系 → 1.8.2系へ。livekit-agents は開発が速いので更新時はAPI差分に注意
+#   ⚠上げた理由: **1.6系のプラグインは gemini-3.8-live を知らない**。
+#     1.6.7 の realtime/api_proto.py の `LiveAPIModels` に 3.8 が無く、
+#     モデル文字列を渡しても agent 経由ではツールが1度も呼ばれなかった
+#     (生のSDKでは 3.1/3.8 とも呼ぶことを infra/scripts/probe_live_tools.py で確認済み)。
+#     1.8.2 の同ファイルには gemini-3.8-live / -extended-thinking が明記されている。
+#   ⚠このイメージは agent / caller-sim / hookd の**3コンテナが共有**している
+#     (docker-compose.yml の build: ../services/agent)。上げるときは3つとも検証すること。
+# cascade構成: silero(VAD) + deepgram(STT) + google(Gemini LLM) + elevenlabs(TTS)
+# 2026-09-25: 1.8.3 へ。Gemini TTS を 3.8 に上げるため — **3.8 の TTS は指示文 (instructions) を
+#   声に出して読む**。1.8.2 は指示文を本文の頭に連結するので、挨拶の前に「電話の受付担当として…」と
+#   喋った (実測)。1.8.3 は 3.8 のとき指示文を speech_metadata.style に逃がす
+livekit-agents[google,deepgram,elevenlabs,silero]~=1.8.3
+asyncpg~=0.30
+# FCM (端末を起こすプッシュ、hookd の push.py)。google-genai 経由で入ってはいるが、
+# 明示しておく — 依存の巻き添えで消えるとプッシュが黙って止まる
+google-auth~=2.38

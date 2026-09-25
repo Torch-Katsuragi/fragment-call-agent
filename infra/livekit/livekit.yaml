@@ -1,0 +1,14 @@
+# LiveKit server 設定 (M1 最小構成)
+port: 7880
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  use_external_ip: true
+redis:
+  address: redis:6379
+keys:
+  # .env の LIVEKIT_API_KEY / SECRET と一致させる (compose では起動時に envsubst するか手動同期)
+  devkey: svejj8xzIJQYUZEClrgPq2B48oXOLPaN3PzxuB6AEes
+logging:
+  level: info

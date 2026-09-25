@@ -1,0 +1,378 @@
+/* =========================================================================
+   スマホ用の画面設計 (2026-08-01)
+
+   ⚠**「サイドバーを隠す」ではなく「スマホ用に置き直す」** のがこのファイルの趣旨。
+     以前は max-width:640px でサイドバーを display:none にしていただけで、
+     設定にも警備にも行けない画面になっていた (隠した機能の行き先が無かった)。
+
+   ⚠**専用電話アプリのWebViewが主戦場**。片手・親指・通話中に見る前提で組む:
+     ・主要な移動は下部タブバー (指の届く位置)
+     ・押せるものは最低44px角
+     ・固定要素はすべて env(safe-area-inset-*) を足す
+       (⚠これが無いとジェスチャーバーや時刻表示に潜り込む — 実機で2度踏んだ)
+
+   ⚠しきい値は 900px。タブレット横持ちはPCレイアウトの方が使いやすい。
+   ========================================================================= */
+
+/* 下部タブバーの高さ。固定要素の逃げ幅の基準にする */
+:root {
+  --nav-h: 58px;
+  --safe-b: env(safe-area-inset-bottom, 0px);
+}
+
+/* PCではタブバーを出さない (サイドバーが担当) */
+.bottom-nav {
+  display: none;
+}
+
+@media (max-width: 899px) {
+  /* ---- 骨格 ------------------------------------------------------------ */
+  .sidebar {
+    display: none;
+  }
+
+  main {
+    /* 下端はタブバー + ジェスチャーバーぶん空ける */
+    padding: 12px 14px calc(var(--nav-h) + var(--safe-b) + 20px);
+  }
+
+  .page-title {
+    font-size: 20px;
+    margin: 4px 0 14px;
+  }
+
+  .section-title {
+    margin: 20px 0 8px;
+    font-size: 13px;
+  }
+
+  /* ---- 下部タブバー ---------------------------------------------------- */
+  .bottom-nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 60;
+    display: flex;
+    background: #12161f;
+    border-top: 1px solid #232a38;
+    padding-bottom: var(--safe-b);
+  }
+
+  .bottom-nav-item {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    height: var(--nav-h);
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 11px;
+  }
+
+  .bottom-nav-item.on {
+    color: var(--text);
+  }
+
+  /* 現在地は上端の線で示す。色だけだと暗い画面では見分けにくい */
+  .bottom-nav-item.on::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    width: 34px;
+    height: 2px;
+    border-radius: 0 0 2px 2px;
+    background: var(--ai);
+  }
+
+  .bottom-nav-icon {
+    font-size: 19px;
+    line-height: 1;
+  }
+
+  /* ---- 固定要素をタブバーの上へ逃がす --------------------------------- */
+  /* ⚠left/right のサイドバーぶんのオフセットも同時に消す */
+  /* ⚠通話バーとタブバーの間に隙間を入れる (2026-09-18)。
+     旧版は `bottom: nav-h + safe-b` でタブバーに**ぴったり接していた**。
+     受話や終了を押すつもりで履歴タブに触るのが通話中の事故になるので、
+     指1本ぶんの逃げと境界線を置く */
+  .call-bar {
+    left: 0;
+    right: 0;
+    bottom: calc(var(--nav-h) + var(--safe-b) + 10px);
+    padding: 10px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+
+  /* ⚠スマホではマイク・スピーカーの選択と音量スライダーを出さない (2026-09-24)。
+     並べていると「通話終了」が画面の右外へ押し出されて見えず、ユーザーが
+     「スマホから通話を切る方法がわからん」となった。端末の音量ボタンと OS の音声経路で足りる */
+  .call-bar .devsel,
+  .call-bar .bar-spacer {
+    display: none;
+  }
+
+  .call-bar .bar-btn.danger {
+    margin-left: auto;
+  }
+
+  .global-call-chip {
+    left: 12px;
+    right: 12px;
+    bottom: calc(var(--nav-h) + var(--safe-b) + 12px);
+  }
+
+  /* ---- ホーム ---------------------------------------------------------- */
+  /* 見出しと操作が1行に収まらないので、操作を次の行へ落として全幅で並べる。
+     ⚠**order は直接の子にしか効かない**。`.toolbar` の子を
+     h1 / .home-actions / .mode-block の3つに保つこと (page.tsx の注記参照)。
+     2026-08-01版は操作類が無名の div に包まれていて order が丸ごと無視され、
+     375px幅でボタンが縦書きに潰れ、応答モードが画面外へはみ出していた */
+  .toolbar {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .home-head .home-actions {
+    order: 2;
+    width: 100%;
+    margin-left: 0; /* PCの右寄せを解除。全幅で2分割する */
+  }
+
+  /* 操作を横いっぱいに並べる。⚠.dialpad-wrap は div なので flex を継がない */
+  .home-head .home-actions > * {
+    flex: 1;
+  }
+
+  .home-head .home-actions .dialpad-wrap > button,
+  .home-head .home-actions > button {
+    width: 100%;
+  }
+
+  .home-head .mode-block {
+    order: 3;
+    width: 100%;
+  }
+
+  .home-head .mode-block .segmented {
+    display: flex;
+    width: 100%;
+  }
+
+  /* 選択中モードの説明を本文として出す (スマホには hover が無く title が読めない) */
+  .mode-desc {
+    display: block;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--muted);
+  }
+
+  /* ⚠44px を下回らせない。実測39pxだった (padding 10px + 13px文字では届かない) */
+  .toolbar .segmented-btn,
+  .set-row .segmented-btn {
+    flex: 1;
+    min-height: 44px;
+    padding: 0 8px;
+    font-size: 13px;
+  }
+
+  .toolbar button:not(.segmented-btn) {
+    min-height: 44px;
+  }
+
+  .cards {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  /* ⚠トップの「最近の通話」は3件で打ち切る。全件出すと画面が履歴で埋まり、
+     上にある応答モードと通話中が下へ押し出されて見えなくなる (2026-08-01の残課題)。
+     全件は履歴タブ (/history) が受け持つので、情報は失われない */
+  .home-recent > *:nth-child(n + 4) {
+    display: none;
+  }
+
+  .recent-more {
+    display: inline;
+  }
+
+  /* ---- 通話履歴 (スマホではこのページがサイドバーの代わり) ------------- */
+  .hist-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .hist-row {
+    /* ⚠タップ領域を稼ぐため、行ではなくカードにする */
+    padding: 12px 14px;
+  }
+
+  /* ---- 通話画面 -------------------------------------------------------- */
+  /* 文字起こしを読むのが主目的。⚠2カラムをやめて縦に積み、会話に高さを与える */
+  .call-main {
+    display: block;
+    /* ⚠PCは下部バーの逃げに padding-bottom:84px を持つが、縦積みのスマホでは
+       それが**雲と会話ストリームの間の死んだ余白**になる (実測で約100px)。
+       バーの逃げは下の .chat-rail 側で取る */
+    padding-bottom: 12px;
+  }
+
+  .chat-rail {
+    /* 画面 - ヘッダー - 下部バー - タブバー。100dvh はアドレスバーの伸縮に追従する */
+    height: calc(100dvh - 300px);
+    min-height: 240px;
+    /* 通話中に出る .call-bar とタブバーのぶんを最後尾で空ける
+       (.call-main から移した。中間の余白にしないため) */
+    margin-bottom: calc(var(--nav-h) + var(--safe-b) + 72px);
+  }
+
+  .chat-input {
+    min-height: 44px;
+    font-size: 16px; /* ⚠16px未満だとiOS Safariがフォーカス時に勝手にズームする */
+  }
+
+  /* ⚠雲は PC の中央カラム用に `height: calc(100vh - 190px)` を持っている。
+     スマホで縦積みにすると**吹き出し1個でも画面を丸ごと占有**し、
+     主役であるはずの文字起こしが画面外へ落ちる
+     (2026-09-18に実測: 吹き出し1個で高さ622px・文字起こしは y=838 で完全に圏外)。
+     上限を与えて、雲と会話の頭が同時に見えるようにする */
+  .fragments-cloud {
+    margin-top: 14px;
+    height: 30dvh;
+    min-height: 160px;
+    max-height: 260px;
+  }
+
+  .bar-btn {
+    min-height: 44px;
+    padding: 10px 14px;
+  }
+
+  /* ---- 設定 ------------------------------------------------------------ */
+  /* ⚠横並びのままだと説明文が2〜3文字幅に潰れる。縦に積んで操作を下に置く */
+  .set-row {
+    display: block;
+  }
+
+  .set-row > * + * {
+    margin-top: 10px;
+  }
+
+  .set-row .segmented {
+    display: flex;
+    width: 100%;
+  }
+
+  .set-row input[type="text"],
+  .set-row select,
+  .set-row textarea {
+    width: 100%;
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .set-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* ---- 警備 ------------------------------------------------------------ */
+  .sec-head {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .sec-nums {
+    word-break: break-all;
+  }
+
+  /* ---- 発信キーパッド -------------------------------------------------- */
+  /* ⚠**旧版は `.dialpad-wrap` に bottom を当てていた**。あれは position:relative の
+     ラッパーなので、bottom は「下端をずらす」= **要素そのものが上へ90px動く**。
+     結果、発信ボタンがタイトルの上に重なっていた (2026-09-18に実機幅で発見)。
+     逃がしたいのは中のパネルの方なので、`.dialpad` (position:absolute) に当てる。
+     スマホでは 240px 固定だと窮屈なので、画面幅いっぱいの固定配置にする */
+  .dialpad {
+    position: fixed;
+    top: auto;
+    left: 12px;
+    right: 12px;
+    width: auto;
+    bottom: calc(var(--nav-h) + var(--safe-b) + 12px);
+  }
+
+  .dialpad-keys button {
+    min-height: 52px;
+    font-size: 20px;
+  }
+
+  /* ---- 共通: 押せるものは44px下限 ------------------------------------- */
+  /* ⚠冒頭の方針を**個別指定で当てていたら取りこぼした** (2026-09-18に実測)。
+     設定ページだけで 36px のボタンが13個あった (許可/不要・QRを表示・編集…)。
+     一律で底上げする。`.segmented-btn`(44) と `.dialpad-keys button`(52) は
+     既に個別指定があり、min-height は大きい方が効くので衝突しない */
+  main button,
+  main select {
+    min-height: 44px;
+  }
+
+  /* つまみは指で掴む。既定16pxだと外す */
+  main input[type="range"] {
+    height: 44px;
+  }
+
+  /* ---- 共通: 横スクロールを起こさない --------------------------------- */
+  /* ⚠長い番号やURLが1語として扱われて画面を押し広げるのを止める */
+  body {
+    overflow-x: hidden;
+  }
+
+  pre,
+  code,
+  .set-val {
+    overflow-x: auto;
+    word-break: break-all;
+  }
+}
+
+/* 設定の行 (2026-09-24)。⚠トグル・短い操作の行は縦に積まない — 名前の右に操作を置く */
+@media (max-width: 899px) {
+  .set-group .set-row {
+    padding: 14px;
+  }
+  .set-row.inline {
+    display: flex;
+    align-items: center;
+  }
+  .set-row.inline > * + * {
+    margin-top: 0;
+  }
+  .set-row.inline .slider-ctl input[type="range"] {
+    width: 110px;
+  }
+  .pair-ctl {
+    width: 100%;
+  }
+  .pair-ctl input {
+    flex: 1;
+    width: auto;
+  }
+  /* ⚠スマホ用の「ボタンは高さ 44px 以上」がスイッチにも掛かって丸く潰れていた (2026-09-24 実機)。
+     スイッチは形が意味なので寸法を固定する。指で押しやすいよう少しだけ大きく */
+  .set-row .switch {
+    min-height: 0;
+    width: 52px;
+    height: 30px;
+  }
+  .set-row .switch::after {
+    width: 24px;
+    height: 24px;
+  }
+  .set-row .switch.on::after {
+    left: 25px;
+  }
+}

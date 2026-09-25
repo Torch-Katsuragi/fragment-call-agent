@@ -1,0 +1,7 @@
+{
+  "trunk": {
+    "name": "asterisk-bridge",
+    "numbers": ["call-agent"],
+    "allowed_addresses": ["127.0.0.1/32"]
+  }
+}

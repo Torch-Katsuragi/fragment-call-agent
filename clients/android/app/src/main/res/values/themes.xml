@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 中身はComposeが描くので、XMLテーマは土台だけ。
+         DayNight にしておくと端末のダークモードにそのまま追従する (API 29+)。
+         ⚠`Theme.DeviceDefault.DayNight` に `.NoActionBar` の派生は無いので、
+           アクションバーは項目で個別に消す (2026-07-31にビルドで判明) -->
+    <style name="Theme.Fragment" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+    </style>
+
+    <!-- 着信画面。ロック画面の上に出るので背景は不透明のまま -->
+    <style name="Theme.Fragment.Incoming" parent="Theme.Fragment">
+        <item name="android:windowShowWallpaper">false</item>
+    </style>
+</resources>

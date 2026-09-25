@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 通知のスモールアイコン。⚠ステータスバーでは単色にマスクされるので、
+     形だけで判別できる必要がある (色を付けても無視される) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFF">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,3L18,8L14,12L8,7z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M7,11L13,16L9,21L3,16z" />
+</vector>

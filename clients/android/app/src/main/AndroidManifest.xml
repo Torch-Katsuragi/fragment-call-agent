@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- self-managed ConnectionService の登録に必要。これがあることで「通話アプリ」と見なされ、
+         Android 14+ でも USE_FULL_SCREEN_INTENT が既定で付与される -->
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 「自分が出る」でマイクを使う (audio/CallAudio.kt) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:name=".FragmentApp"
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="false"
+        android:usesCleartextTraffic="false"
+        android:theme="@style/Theme.Fragment">
+
+        <!-- 管制室。着信に応答すると room を持って起動する。
+             ⚠ロック画面の上に出すのは**応答したときだけ** (MainActivity.onCreate で動的に設定)。
+               2026-09-19 まではマニフェストで常時 showWhenLocked にしていたため、スタンバイの鳴動が
+               期限切れで閉じた瞬間に、下にいた管制室が会話履歴ごとロック画面に出た (ユーザー指摘) -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 接続先と端末トークンの設定。初回起動時のみ。
+             deep link `fragment://pair?url=...&token=...` で欄を埋められる (2026-09-18)。
+             ⚠exported=true が要るのはこのため。値は欄に入るだけで、保存は本人が押す
+               (SetupActivity.kt の注記)。adb の input text が日本語 IME で化けるための逃げ道 -->
+        <activity
+            android:name=".ui.SetupActivity"
+            android:exported="true"
+            android:label="@string/setup_title">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="fragment" android:host="pair" />
+            </intent-filter>
+        </activity>
+
+        <!-- 着信画面 (full-screen intent の行き先)。ロック画面でも全画面で出る。
+             ⚠taskAffinity="" で**管制室とは別のタスク**にする (2026-09-19)。同じタスクに積むと、
+               閉じたときに下の管制室が顔を出す。別タスクなら閉じた先はロック画面のまま -->
+        <activity
+            android:name=".ui.IncomingCallActivity"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/Theme.Fragment.Incoming" />
+
+        <!-- AI応対中の表示 (2026-09-19)。「通話中」通知の full-screen intent で開く。
+             管制室とは別タスク (閉じた先がロック画面のまま) -->
+        <activity
+            android:name=".ui.LiveCallActivity"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/Theme.Fragment.Incoming" />
+
+        <!-- 自己管理型の通話サービス。OSの通話UX (音声ルーティング・他通話との調停) に乗るために要る -->
+        <service
+            android:name=".call.FragmentConnectionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
+
+        <!-- 管制室(hookd)を見張る常駐サービス。取り次ぎ要求が来たら鳴らす -->
+        <service
+            android:name=".WatchService"
+            android:exported="false"
+            android:foregroundServiceType="phoneCall" />
+
+        <receiver
+            android:name=".call.CallActionReceiver"
+            android:exported="false" />
+
+        <!-- FCM の受け口 (2026-09-18)。hookd が着信・取り次ぎの瞬間に「起きろ」を送る。
+             接続情報は管制室が配る (google-services.json 無し。push/PushSetup.kt の注記) -->
+        <service
+            android:name=".push.PushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>

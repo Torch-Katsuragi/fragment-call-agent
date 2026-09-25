@@ -1,0 +1,22 @@
+.env
+.env.local
+infra/secrets/
+infra/asterisk/pjsip.conf
+*.tfstate
+*.tfstate.backup
+.terraform/
+tfplan
+*.tfplan
+__pycache__/
+node_modules/
+.next/
+tsconfig.tsbuildinfo
+recordings/
+data/
+# VM の .env の写し (dev_agent.sh が使う)。秘密なので絶対にコミットしない
+.env.vm
+# agent を手元で回すための venv (dev_agent.sh)。2026-09-18 に git add -A で巻き込んだので明示
+services/agent/.venv/
+
+# 公開用の書き出しの置き換え表 (実値入り。export_public.py 参照)
+infra/scripts/publish-map.local

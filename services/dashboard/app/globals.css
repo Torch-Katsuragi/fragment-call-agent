@@ -1,0 +1,1338 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --border: #2a2f3a;
+  --text: #e6e9ef;
+  --muted: #8b93a3;
+  --accent: #4f8cff;
+  --caller: #ffb454;
+  --ai: #7ee0a3;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+main {
+  flex: 1;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 24px 24px 80px;
+}
+
+/* ===== 左サイドバー (会話一覧) ===== */
+/* 履歴だけスクロールさせ、アカウントカードを常に左下に固定するため
+   sidebar自体は overflow:hidden の縦フレックスにする (2026-07-26) */
+.sidebar {
+  width: 250px;
+  flex-shrink: 0;
+  background: #0b0d11;
+  border-right: 1px solid var(--border);
+  height: 100vh;
+  position: sticky;
+  top: 0;
+  overflow: hidden;
+  padding: 12px 8px 8px;
+  display: flex;
+  flex-direction: column;
+}
+
+.side-scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0; /* これが無いとflex子要素が縮まずスクロールしない */
+}
+
+.side-title {
+  font-size: 15px;
+  font-weight: 700;
+  padding: 8px 10px 14px;
+  color: var(--text);
+}
+
+.side-group {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 12px 10px 4px;
+}
+
+.side-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.side-item:hover {
+  background: var(--panel);
+}
+
+.side-item.current {
+  background: #232a38;
+}
+
+.side-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.side-time {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ===== アカウントカード (サイドバー左下) ===== */
+.account-card {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px;
+  margin-top: 6px;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 8px 8px;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.account-card:hover {
+  background: var(--panel);
+}
+
+.account-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  object-fit: cover;
+}
+
+.account-avatar.lg {
+  width: 42px;
+  height: 42px;
+}
+
+.account-avatar-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.account-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+}
+
+.account-name {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-sub {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-gear {
+  color: var(--muted);
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+/* ===== 設定ページ ===== */
+.settings {
+  max-width: 720px;
+}
+
+.page-title {
+  font-size: 20px;
+  margin: 0 0 20px;
+}
+
+.set-section {
+  margin-bottom: 28px;
+}
+
+.set-heading {
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+
+.set-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 8px;
+}
+
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.set-row-title {
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.set-row-desc {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+/* 応対プロンプトの編集欄 (2026-07-30)。mdをそのまま触るので等幅・折り返しあり */
+.persona-editor {
+  width: 100%;
+  margin: 8px 0;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  resize: vertical;
+  white-space: pre-wrap;
+}
+
+.set-note {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 10px;
+  line-height: 1.6;
+}
+
+.set-note code {
+  background: var(--panel);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.set-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 8px;
+}
+
+.set-grid > div {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+
+.set-key {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.set-val {
+  display: block;
+  font-size: 14px;
+  margin-top: 2px;
+}
+
+.badge {
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.badge.ok {
+  color: var(--ai);
+  border-color: #2f5d43;
+}
+
+.btn-quiet {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn-quiet:hover {
+  background: #232a38;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: #2a2f3a;
+  border: none;
+  border-radius: 999px;
+  padding: 5px 12px 5px 5px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.toggle.on {
+  background: #2f5d43;
+}
+
+.toggle-knob {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.toggle.on .toggle-knob {
+  background: var(--ai);
+}
+
+/* 3択スイッチ (応答モード: 不在 / スタンバイ / 自分で出る)。2026-08-01 */
+.segmented {
+  display: inline-flex;
+  background: #2a2f3a;
+  border-radius: 999px;
+  padding: 3px;
+  flex-shrink: 0;
+}
+
+.segmented-btn {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.segmented-btn.on {
+  background: #2f5d43;
+  color: var(--text);
+}
+
+.segmented-btn:disabled {
+  cursor: default;
+}
+
+/* ===== カード (トップ画面) ===== */
+.section-title {
+  font-size: 14px;
+  color: var(--muted);
+  margin: 24px 0 10px;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  min-height: 120px;
+  transition: border-color 0.15s;
+}
+
+.card:hover {
+  border-color: var(--accent);
+}
+
+.card.live {
+  border-color: #2f6b46;
+  box-shadow: 0 0 0 1px #2f6b46 inset;
+}
+
+.card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+
+.card-caller {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.card-preview .seg {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.badge-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ai);
+}
+
+.pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ai);
+  flex-shrink: 0;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgba(126, 224, 163, 0.5);
+  }
+  50% {
+    opacity: 0.6;
+    box-shadow: 0 0 0 5px rgba(126, 224, 163, 0);
+  }
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.room-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 8px;
+  background: var(--panel);
+}
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  min-height: 320px;
+  max-height: 65vh;
+  overflow-y: auto;
+}
+
+.seg {
+  line-height: 1.6;
+}
+
+/* 通話詳細のLINE風吹き出し (相手=左・白 / AI=右・濃グレー / 本人=右・緑) */
+.msg {
+  display: flex;
+}
+.msg.left {
+  justify-content: flex-start;
+}
+.msg.right {
+  justify-content: flex-end;
+}
+.msg-inner {
+  max-width: 78%;
+  display: flex;
+  flex-direction: column;
+}
+.msg.right .msg-inner {
+  align-items: flex-end;
+}
+.msg-tag {
+  font-size: 10.5px;
+  color: var(--muted);
+  margin-bottom: 2px;
+  padding: 0 4px;
+}
+.msg-bubble {
+  padding: 8px 13px;
+  border-radius: 16px;
+  font-size: 14px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg.caller .msg-bubble {
+  background: #f2f3f5;
+  color: #1b1e24;
+  border-top-left-radius: 5px;
+}
+.msg.ai .msg-bubble {
+  background: #394050;
+  color: var(--text);
+  border-top-right-radius: 5px;
+}
+.msg.user .msg-bubble {
+  background: #6fdd7b;
+  color: #0b2e13;
+  border-top-right-radius: 5px;
+}
+.msg.interim {
+  opacity: 0.55;
+}
+
+.seg .speaker {
+  font-size: 12px;
+  margin-right: 8px;
+}
+
+.seg.caller .speaker {
+  color: var(--caller);
+}
+
+.seg.ai .speaker {
+  color: var(--ai);
+}
+
+.seg.interim {
+  opacity: 0.55;
+}
+
+.toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin: 12px 0;
+}
+
+/* グローバル通話チップ: 通話画面以外にいる時、通話中であることを示し音声も流れている */
+.global-call-chip {
+  position: fixed;
+  bottom: 16px;
+  left: 266px;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 8px 14px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  font-size: 13px;
+}
+.global-call-chip a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 着信バナー (留守電OFF時は受話ボタン付き) */
+.ringing-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+}
+.ringing-label {
+  font-weight: 600;
+}
+/* グローバル版: どの画面でも画面上部中央に浮かぶ */
+.ringing-banner.global {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 50;
+  width: max-content;
+  max-width: min(760px, 90vw);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+.verdict-badge.bad {
+  background: rgba(255, 107, 107, 0.15);
+  border: 1px solid #ff6b6b;
+  color: #ff9c9c;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  flex: none;
+}
+.ringing-lookup {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* 通話詳細 = web会議風レイアウト:
+   中央 .call-main (フラグメント+バー) / 右 .chat-rail (全高固定の会話ストリーム+耳打ち入力) */
+/* 通話画面では main の幅制限 (880px) を外してレール2本にフルブリードさせる */
+main:has(.call-main) {
+  max-width: none;
+  margin: 0;
+}
+.call-main {
+  margin-right: 416px;
+  padding-bottom: 84px; /* 下部バーレールに隠れないための余白 */
+}
+/* フラグメントクラウド: 吹き出しが押し合いへし合いする物理配置キャンバス */
+.fragments-cloud {
+  position: relative;
+  height: calc(100vh - 190px);
+  overflow: hidden;
+  padding: 0;
+}
+.fragments-cloud .fragments-title {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  z-index: 2;
+}
+.cloud-empty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+.fbubble {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  max-width: 240px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 9px 16px;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    left 0.4s cubic-bezier(0.22, 1, 0.36, 1),
+    top 0.4s cubic-bezier(0.22, 1, 0.36, 1),
+    border-radius 0.25s;
+  animation: bubble-pop 0.3s ease-out;
+  z-index: 1;
+}
+.fbubble.measuring {
+  opacity: 0;
+}
+.fbubble.open {
+  border-radius: 16px;
+  white-space: pre-wrap;
+  max-width: 340px;
+  width: max-content;
+  max-height: min(380px, 60vh);
+  overflow-y: auto;
+  text-overflow: clip;
+  font-size: 13.5px;
+  padding: 12px 16px;
+  z-index: 3;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+.fbubble.alert {
+  border-color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.1);
+}
+.fbubble.hint {
+  border-color: var(--ai);
+  background: rgba(126, 224, 163, 0.1);
+}
+.fbubble-icon {
+  margin-right: 6px;
+}
+.chat-rail {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 400px;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  z-index: 30;
+}
+.chat-rail-head {
+  padding: 14px 16px;
+  font-size: 12.5px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  letter-spacing: 0.06em;
+}
+.chat-stream {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chat-input {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+}
+.chat-input input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13.5px;
+}
+.chat-input input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.chat-input input:disabled {
+  opacity: 0.5;
+}
+.msg.whisper .msg-bubble {
+  background: rgba(126, 224, 163, 0.12);
+  border: 1.5px dashed var(--ai);
+  border-top-right-radius: 5px;
+}
+.fragments {
+  min-width: 0;
+  overflow-y: auto;
+}
+@media (max-width: 1100px) {
+  .call-main {
+    margin-right: 0;
+  }
+  .chat-rail {
+    position: static;
+    width: 100%;
+    height: 60vh;
+    margin-top: 14px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+  }
+  .call-bar {
+    position: static;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    margin-top: 14px;
+  }
+}
+
+/* 下部バーもレール: サイドバーとチャットレールの間の帯として画面下に固定 */
+.call-bar {
+  position: fixed;
+  left: 250px; /* サイドバー幅 */
+  right: 400px; /* チャットレール幅 */
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  padding: 12px 18px;
+  z-index: 25;
+}
+.bar-spacer {
+  flex: 1;
+}
+.bar-btn.danger {
+  background: #e5484d;
+}
+.devsel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.devsel select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  max-width: 180px;
+  font-size: 12.5px;
+}
+.speak-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--border);
+  flex: none;
+  transition: background 0.1s;
+}
+.speak-dot.on {
+  background: var(--ai);
+  box-shadow: 0 0 8px var(--ai);
+}
+.elapsed {
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.fragments-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 10px;
+  letter-spacing: 0.06em;
+}
+.bubble {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  animation: bubble-pop 0.25s ease-out;
+}
+.bubble.alert {
+  border-color: #ff6b6b;
+  background: rgba(255, 107, 107, 0.08);
+}
+.bubble.hint {
+  border-color: var(--ai);
+  background: rgba(126, 224, 163, 0.08);
+}
+.bubble-kind {
+  margin-right: 6px;
+}
+@keyframes bubble-pop {
+  from {
+    transform: scale(0.85);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@media (max-width: 900px) {
+  .call-cols {
+    flex-direction: column;
+  }
+  .fragments {
+    position: static;
+    max-height: none;
+    width: 100%;
+  }
+}
+
+/* ===== スマホ幅 (専用電話アプリのWebViewが主用途) =====
+   ⚠DESIGN §6.1 は当初「スマホ表示は緊急時のフォールバックで、ここに投資しない」としていたが、
+     2026-08-01に**アプリが管制室をWebViewで出す**設計にした時点で前提が変わった —
+     ここがアプリの主画面そのものになる。
+   まずはサイドバーを畳んで通話画面を全幅にする最小対応 (B案)。
+   引き出し式サイドバー (A案) は履歴・設定へ到達したくなった段階で足す。 */
+/* ⚠スマホ用の設計は app/mobile.css に移した (2026-08-01)。
+   隠すだけのCSSではなく、下部タブバー・履歴ページを含む画面設計になっている */
+
+
+/* 留守電 (AI応答) トグルスイッチ */
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  padding: 6px 14px 6px 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.toggle.on {
+  color: var(--text);
+  border-color: var(--ai);
+}
+.toggle-track {
+  width: 38px;
+  height: 20px;
+  border-radius: 10px;
+  background: var(--border);
+  position: relative;
+  transition: background 0.15s;
+  flex: none;
+}
+.toggle.on .toggle-track {
+  background: var(--ai);
+}
+.toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: left 0.15s;
+}
+.toggle.on .toggle-knob {
+  left: 20px;
+}
+
+button,
+.lk-start-audio-button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+/* 着信の「切る」(相手ごと切る) */
+button.btn-danger {
+  background: #e24b4a;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---- エラー画面 (2026-07-31) ---- */
+.errscreen {
+  max-width: 620px;
+}
+.errscreen-lead {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.8;
+  margin: 0 0 20px;
+}
+.errscreen-lead b {
+  color: var(--text);
+}
+.errscreen-actions {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 24px;
+}
+.errscreen-detail {
+  color: var(--muted);
+  font-size: 13px;
+}
+.errscreen-detail summary {
+  cursor: pointer;
+}
+.errscreen-detail pre {
+  margin: 10px 0 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+}
+
+/* ---- 発信キーパッド (2026-07-19) ---- */
+.dialpad-wrap {
+  position: relative;
+}
+.dialpad {
+  position: absolute;
+  top: 44px;
+  right: 0;
+  z-index: 60;
+  width: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+}
+.dialpad input {
+  width: 100%;
+  font-size: 16px;
+  letter-spacing: 1px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.dialpad-keys {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.dialpad-keys button {
+  padding: 10px 0;
+  font-size: 16px;
+}
+.dialpad-actions {
+  display: flex;
+  gap: 6px;
+}
+.dialpad-actions .dial-go {
+  flex: 1;
+}
+
+/* ===== 警備 (SIP不正利用の検知、2026-07-26) ===== */
+/* グローバル帯: 未確認の検知があると、どの画面にいても目に入る位置に出す。
+   2026-07-26の侵入で足りなかったのは遮断ではなく「気づく手段」だった */
+.security-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(255, 180, 84, 0.12);
+  border: 1px solid var(--caller);
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  color: var(--text);
+  font-size: 14px;
+}
+.security-banner.critical {
+  background: rgba(255, 107, 107, 0.14);
+  border-color: #ff6b6b;
+}
+.security-banner-label {
+  font-weight: 600;
+}
+
+.sec-event {
+  border-left: 3px solid var(--caller);
+}
+.sec-event.critical {
+  border-left-color: #ff6b6b;
+}
+.sec-event.acked {
+  opacity: 0.55;
+}
+.sec-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.sec-kind {
+  font-weight: 600;
+}
+.sec-action {
+  font-size: 12px;
+  border-radius: 999px;
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.sec-action.reject {
+  border-color: #ff6b6b;
+  color: #ff9c9c;
+  background: rgba(255, 107, 107, 0.12);
+}
+.sec-count {
+  font-size: 12px;
+  color: var(--caller);
+}
+.sec-nums {
+  font-size: 13.5px;
+  margin-bottom: 4px;
+}
+.sec-blocked {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.sec-reason {
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== 通話履歴ページ (2026-08-01) =====
+   ⚠スマホでサイドバーが出せないぶんの受け皿。PCから開いても使える */
+.hist-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hist-row {
+  display: block;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: var(--text);
+}
+
+.hist-row:hover {
+  border-color: var(--accent);
+}
+
+.hist-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 14px;
+}
+
+.hist-name {
+  flex: 1;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hist-time {
+  font-size: 12px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.hist-preview {
+  margin-top: 6px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.hist-preview > div {
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+}
+
+/* ===== トップのヘッダー (2026-09-18) =====
+   ⚠`.toolbar` の直接の子は h1 / .home-actions / .mode-block の3つに保つこと。
+     スマホ用CSSが order で並べ替えるため (order は直接の子にしか効かない)。 */
+.home-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-left: auto; /* PCでは操作と応答モードを右端へ寄せる (旧 space-between の代わり) */
+}
+
+.mode-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 選択中モードの説明。PCは各ボタンの title 属性で読めるので出さない */
+.mode-desc {
+  display: none;
+}
+
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* 「すべて見る」はスマホだけ (PCはサイドバーに履歴があり、カードも全件出る) */
+.recent-more {
+  display: none;
+  font-size: 13px;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+/* トップの応答モード表示 (表示だけ。切替は設定ページ) 2026-09-19 */
+.mode-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--border, #333);
+  color: inherit;
+  text-decoration: none;
+  font-weight: 600;
+}
+.mode-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #888;
+}
+.mode-dot.away { background: #4caf50; }
+.mode-dot.standby { background: #ffb300; }
+.mode-dot.manual { background: #5ec8ff; }
+
+/* ===== 設定: 節ごとのカードと行 (2026-09-24 整理) =====
+   ⚠1 節 = 1 枚のカード。行は区切り線で並べ、行ごとに枠を付けない (枠だらけで読みにくかった) */
+.set-group {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.set-group > * + * {
+  border-top: 1px solid var(--border);
+}
+.set-group .set-row {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  margin: 0;
+  padding: 14px 16px;
+}
+/* ⚠区切り線は .set-group .set-row { border: none } より後ろ・同じ強さで書く。
+   先に書いた `.set-group > * + *` だけだと行の border: none に負けて線が消えていた (2026-09-24 実機) */
+.set-group > * + .set-row {
+  border-top: 1px solid var(--border);
+}
+.set-row-text {
+  min-width: 0;
+  flex: 1;
+}
+.set-foot {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 8px 4px 0;
+  line-height: 1.6;
+}
+/* 行の下に広がる中身 (QR・プロンプトの編集欄) */
+.set-sub {
+  padding: 0 16px 14px;
+}
+.set-group > .set-sub {
+  border-top: none;
+}
+.set-val-inline {
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.slider-ctl {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.slider-ctl input[type="range"] {
+  width: 140px;
+}
+.pair-ctl {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.pair-ctl input {
+  width: 130px;
+  padding: 7px 10px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.pair-qr {
+  display: block;
+  background: #fff;
+  border-radius: 8px;
+  margin: 4px 0 8px;
+}
+
+/* オン/オフのスイッチ (components/Toggle.tsx)。⚠アニメーションは付けない */
+.switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 46px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: #3a404c;
+  cursor: pointer;
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+}
+.switch.on {
+  background: #2f9e62;
+}
+.switch.on::after {
+  left: 23px;
+}
+.switch:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

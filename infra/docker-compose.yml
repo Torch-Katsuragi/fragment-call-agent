@@ -1,0 +1,301 @@
+# Call-Agent M1: LiveKit + SIP + エコーエージェント
+# 使い方: リポジトリ直下の .env を読み込む (docker compose --env-file ../.env ...)
+#
+# プロファイル:
+#   (default)  : livekit + redis + livekit-sip + agent
+#   asterisk   : LiveKit SIP が REGISTER 非対応だった場合の仲介 (M1検証で判断)
+
+# 全サービス共通のログ上限 (2026-07-26)。VM常駐化に伴い必須 —
+# json-fileドライバのデフォルトは無制限で、エラーループ等でディスク/メモリを食い潰す
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  redis:
+    image: redis:7-alpine
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"  # host network 上の sip から 127.0.0.1:6379 で届くように公開 (外部には出さない)
+
+  livekit:
+    image: livekit/livekit-server:latest
+    logging: *default-logging
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7880:7880"            # WebSocket / API
+      - "7881:7881"            # TCP fallback (WebRTC)
+      - "50000-50100:50000-50100/udp"  # WebRTC media (レンジは livekit.yaml と一致させる)
+    depends_on:
+      - redis
+
+  sip:
+    image: livekit/sip:latest
+    logging: *default-logging
+    restart: unless-stopped
+    network_mode: host          # SIP/RTP は NAT を挟まない方が事故が少ない
+    environment:
+      SIP_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY}
+        api_secret: ${LIVEKIT_API_SECRET}
+        ws_url: ws://127.0.0.1:7880
+        redis:
+          address: 127.0.0.1:6379
+        sip_port: 5060
+        rtp_port: 10000-10500
+        # Asterisk 仲介構成では LiveKit SIP は常に localhost の Asterisk としか話さない。
+        # 外部IPを名乗るとヘアピンで死ぬ (2026-07-15) — 対外NATは Asterisk 側の仕事
+        use_external_ip: false
+    depends_on:
+      - livekit
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    logging: *default-logging
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: callagent
+      POSTGRES_PASSWORD: callagent   # ローカル専用。GCP常駐化の際に見直す
+      POSTGRES_DB: callagent
+    ports:
+      - "127.0.0.1:5432:5432"        # ホストで動く dashboard (Next.js) から接続する
+    volumes:
+      # named volume を使う (バインドマウントだと /mnt/c の drvfs が chmod 不可で initdb が失敗する — 2026-07-16実測)。
+      # compose down では消えない。消すには docker volume rm infra_callagent-pgdata
+      - callagent-pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  # TTS_PROVIDER=voicevox で使う場合のみ起動 (--profile voicevox)。
+  # このPC(省電力CPU)ではCPU合成が1文約6秒で電話には不適だった (2026-07-16実測) — 強いマシンなら選択肢
+  voicevox:
+    image: voicevox/voicevox_engine:cpu-latest
+    profiles: ["voicevox"]
+    logging: *default-logging
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:50021:50021"   # ホストから話者一覧の確認・試聴用 (curl localhost:50021/speakers)
+
+  agent:
+    build: ../services/agent
+    logging: *default-logging
+    restart: unless-stopped
+    environment:
+      OWNER_NAME: ${OWNER_NAME:-}   # 本人の呼び名 (AI への指示文・相手役のセリフ)。氏名をソースに書かないため .env から
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      # ⚠取り次ぎ (request_handoff) の宛先。コード既定の host.docker.internal は
+      #   Linuxでは extra_hosts が無いと解決できず、**実測で毎回DNSエラーに落ちて
+      #   例外フォールバックが「つかまりませんでした」と言っていた** (2026-08-01発覚。
+      #   台詞が正常系と同じなのでシナリオテストまで偽PASSした)。
+      #   同一composeネットワークなのでサービス名で直接届く
+      HOOKD_URL: http://hookd:8790
+      # M2: AIコア (AI_CORE=live がデフォルト。cascade は賢いが遅い)
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
+      ELEVEN_API_KEY: ${ELEVEN_API_KEY}
+      AI_CORE: ${AI_CORE:-live}
+      GEMINI_VOICE: ${GEMINI_VOICE:-Leda}
+      # モデル指定と定型文の経路 (2026-09-18)。⚠.envに書いてもここに列挙しないと届かない
+      #   (この日も踏んだ: FIXED_LINES_VIA_MODEL=1 を .env に足しただけでコンテナでは空だった)
+      GEMINI_LIVE_MODEL: ${GEMINI_LIVE_MODEL:-gemini-3.8-live}
+      GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-gemini-3.5-flash}
+      FIXED_LINES_VIA_MODEL: ${FIXED_LINES_VIA_MODEL:-0}
+      # live のターン検出: 相手の発話終了と見なすまでの沈黙 (ms)。3.8 は既定だと一拍で食い付く (2026-09-18)
+      LIVE_END_SILENCE_MS: ${LIVE_END_SILENCE_MS:-800}
+      TTS_PROVIDER: ${TTS_PROVIDER:-gemini}
+      # STT (デフォルト deepgram。google = Cloud STT v2、SA鍵はTTSと共用)
+      STT_PROVIDER: ${STT_PROVIDER:-deepgram}
+      GOOGLE_STT_MODEL: ${GOOGLE_STT_MODEL:-latest_long}
+      GOOGLE_STT_LOCATION: ${GOOGLE_STT_LOCATION:-global}
+      # 無音で発話を確定するまでの秒数。⚠既定0 = 指定しない (Google任せ)。
+      # 値を入れると相手の1発話目しか認識されなくなる (2026-07-31にA/Bで確定。agent.pyの注記参照)
+      GOOGLE_STT_END_TIMEOUT: ${GOOGLE_STT_END_TIMEOUT:-0}
+      # TTS_PROVIDER=google 用 (Cloud TTS Chirp3-HD。鍵は infra/secrets/ に置く)
+      GOOGLE_TTS_VOICE: ${GOOGLE_TTS_VOICE:-ja-JP-Chirp3-HD-Leda}
+      GOOGLE_TTS_CREDENTIALS: /secrets/callagent-tts.json
+      # 1=ストリーミング合成 (初動0.11s・韻律乱れあり) / 0=文単位一括 (初動1秒強・安定)
+      GOOGLE_TTS_STREAMING: ${GOOGLE_TTS_STREAMING:-0}
+      VOICEVOX_URL: http://voicevox:50021
+      VOICEVOX_SPEAKER: ${VOICEVOX_SPEAKER:-2}
+      # TTS_PROVIDER=aivis 用 (Aivis Cloud API・声=コハク)。
+      # ⚠.envに書いてもここに列挙しないとコンテナに届かない (2026-07-30に踏んで
+      #   「AIが一言も発しない」= AIVIS_API_KEY未設定でTTS生成が例外死、を出した)
+      AIVIS_API_KEY: ${AIVIS_API_KEY:-}
+      AIVIS_MODEL_UUID: ${AIVIS_MODEL_UUID:-}
+      AIVIS_SPEAKING_RATE: ${AIVIS_SPEAKING_RATE:-1.2}
+      # 音量。1.0だと電話で「声が小さい」= 切替前のGoogleより約8dB低かった (2026-07-30実測)
+      AIVIS_VOLUME: ${AIVIS_VOLUME:-1.5}
+      TRANSCRIPT_DIR: /data/transcripts
+      # 応対プロンプト (設定/情報の扱い.md・設定/人格と態度.md) の読み先。
+      # 通話ごとに読むので、管制室やObsidianで直せば次の通話から効く (2026-07-30)
+      FRAGMENT_WORKSPACE: /fragment
+      DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent
+      # 警備 (SIP不正利用の最終防衛線)。既定値のままで動くので未設定でよい —
+      # ⚠compose に書き忘れると .env に書いても届かない (2026-07-18に踏んだ罠)
+      SECURITY_ENFORCE: ${SECURITY_ENFORCE:-1}
+      SECURITY_LOCAL_NUMBERS: ${SECURITY_LOCAL_NUMBERS:-}
+      SECURITY_ALLOW_NUMBERS: ${SECURITY_ALLOW_NUMBERS:-}
+      SECURITY_STRICT_CALLEE: ${SECURITY_STRICT_CALLEE:-0}
+      SECURITY_MIN_CALLER_DIGITS: ${SECURITY_MIN_CALLER_DIGITS:-6}
+      SECURITY_RATE_MAX: ${SECURITY_RATE_MAX:-5}
+      SECURITY_RATE_WINDOW_SEC: ${SECURITY_RATE_WINDOW_SEC:-600}
+      SECURITY_BLOCK_SEC: ${SECURITY_BLOCK_SEC:-3600}
+    volumes:
+      - ../data:/data
+      - ./secrets:/secrets:ro
+      # 応対プロンプトのmdを読むため (読み取り専用。書くのは管制室=ホスト側)
+      - ${FRAGMENT_WORKSPACE_HOST:-/srv/fragment/workspace}:/fragment:ro
+    depends_on:
+      - livekit
+      - postgres
+
+  # テスト用の相手役エージェント (caller-sim)。明示ディスパッチ専用なので実着信には影響しない。
+  # 管制室の「テスト通話」ボタン → /api/testcall → dispatch で起動する
+  #
+  # ⚠ 常時起動しない (2026-07-26)。agent と同じ livekit-agents イメージなので**約500MBを常駐で食う**
+  # (実測でagentに次ぐ2位) のに、実着信では1バイトも仕事をしない。e2-medium (3.8GB) では
+  # この500MBが効くので `testcall` プロファイルに隔離し、テストしたい時だけ起動する:
+  #   docker compose --env-file ../.env --profile testcall up -d caller-sim   # 起動
+  #   docker compose --env-file ../.env --profile testcall stop caller-sim   # 停止
+  # 起動していない間は管制室の「🧪テスト通話」を押しても相手役が入室しない
+  # (アシスタントだけが挨拶して終わる通話行が残る)
+  caller-sim:
+    build: ../services/agent
+    profiles: ["testcall"]
+    logging: *default-logging
+    restart: unless-stopped
+    command: python caller_sim.py start
+    environment:
+      OWNER_NAME: ${OWNER_NAME:-}   # 本人の呼び名 (AI への指示文・相手役のセリフ)。氏名をソースに書かないため .env から
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      GOOGLE_TTS_CREDENTIALS: /secrets/callagent-tts.json
+      SIM_VOICE: ${SIM_VOICE:-ja-JP-Chirp3-HD-Charon}
+    volumes:
+      - ./secrets:/secrets:ro
+    depends_on:
+      - livekit
+
+  # 着信フックAPI (Asteriskが INVITE 到着の瞬間に叩く → 下調べジョブ投入)。
+  # agent と同じイメージで command だけ差し替え。Asterisk は host network なので
+  # WSL2 の 127.0.0.1:8790 に公開する
+  hookd:
+    build: ../services/agent
+    logging: *default-logging
+    restart: unless-stopped
+    command: python hookd.py
+    environment:
+      DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent
+      # スタンバイで端末を鳴らす秒数。⚠asterisk 側 (ダイヤルプランの ENV) と同じ値を渡す (2026-09-18)
+      STANDBY_RING_SEC: ${STANDBY_RING_SEC:-2}
+      # テスト通話シミュレータがルーム作成+caller-simディスパッチに使う
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      # 発信 (/dial): Asterisk は host network なので host-gateway 経由で AMI に届く
+      AMI_HOST: ${AMI_HOST:-host.docker.internal}
+      AMI_PORT: ${AMI_PORT:-5038}
+      AMI_USER: ${AMI_USER:-callagent}
+      AMI_SECRET: ${AMI_SECRET:-callagent-local}
+      # 発信時に相手へ通知する番号 (My050)。未指定だと非通知になり相手のブロックに弾かれる
+      # ⚠桁を間違えない (050 番号は 11 桁)。2026-07-26まで10桁の誤記が既定値だった —
+      # 発信は成功していたが、ブラステル側が正番号に差し替えていたためと推定
+      OUTBOUND_CALLERID: ${OUTBOUND_CALLERID:-}
+      # 警備 (SIP不正利用の関門 /guard + 通知)。詳細は .env.example / services/agent/security.py
+      SECURITY_ENFORCE: ${SECURITY_ENFORCE:-1}
+      SECURITY_LOCAL_NUMBERS: ${SECURITY_LOCAL_NUMBERS:-}
+      SECURITY_ALLOW_NUMBERS: ${SECURITY_ALLOW_NUMBERS:-}
+      SECURITY_STRICT_CALLEE: ${SECURITY_STRICT_CALLEE:-0}
+      SECURITY_MIN_CALLER_DIGITS: ${SECURITY_MIN_CALLER_DIGITS:-6}
+      SECURITY_RATE_MAX: ${SECURITY_RATE_MAX:-5}
+      SECURITY_RATE_WINDOW_SEC: ${SECURITY_RATE_WINDOW_SEC:-600}
+      SECURITY_BLOCK_SEC: ${SECURITY_BLOCK_SEC:-3600}
+      SECURITY_STORM_MAX: ${SECURITY_STORM_MAX:-12}
+      SECURITY_STORM_WINDOW_SEC: ${SECURITY_STORM_WINDOW_SEC:-300}
+      # 検知の通知先 (Discord/SlackのWebhook URL)。未設定なら管制室UIにだけ出る
+      SECURITY_WEBHOOK_URL: ${SECURITY_WEBHOOK_URL:-}
+      DASHBOARD_URL: ${DASHBOARD_URL:-}
+      # 録音の掃除。⚠**0 = 掃除しない (既定)**。日数を入れたときだけ動く。
+      # 録音は取り返しがつかないので、何日で消すかは運用の判断に委ねてある
+      RECORDING_RETENTION_DAYS: ${RECORDING_RETENTION_DAYS:-0}
+      # FCM で端末を起こす (2026-09-18)。サービスアカウント鍵のコンテナ内パス。
+      # 未設定なら押さない (ロングポーリングのみ)。鍵は infra/secrets/ に置く
+      FCM_SERVICE_ACCOUNT: ${FCM_SERVICE_ACCOUNT:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 録音の掃除係が消すために要る。⚠書き込む唯一の理由がこれ。
+      # 録音そのものを作るのは asterisk 側 (MixMonitor)
+      - ../data/recordings:/recordings
+      - ./secrets:/secrets:ro
+    ports:
+      - "127.0.0.1:8790:8790"
+    depends_on:
+      - postgres
+
+  # ---- Directory Agent worker (VM専用プロファイル、2026-07-25) ----
+  # ローカルPCでは従来どおりホストプロセスで実行する (G:のフラグメントworkspaceを直接読むため)。
+  # VMでは同期済みワークスペースをマウントし、--profile vm-worker で起動する:
+  #   docker compose --env-file ../.env --profile asterisk --profile vm-worker up -d
+  directory-agent:
+    build: ../services/directory-agent
+    profiles: ["vm-worker"]
+    logging: *default-logging
+    restart: unless-stopped
+    environment:
+      OWNER_NAME: ${OWNER_NAME:-}   # 本人の呼び名 (AI への指示文・相手役のセリフ)。氏名をソースに書かないため .env から
+      DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      # サーバーでは agy (Antigravity CLI) を使えないので Gemini 直呼び固定 (2026-07-17実測)
+      DIRECTORY_AGENT_BACKEND: gemini
+      FRAGMENT_WORKSPACE: /fragment
+      # 判断層の取り次ぎ発火 (fire_handoff)。agentと同じ理由でサービス名直指定
+      HOOKD_URL: http://hookd:8790
+    volumes:
+      - ${FRAGMENT_WORKSPACE_HOST:-/srv/fragment/workspace}:/fragment
+    depends_on:
+      - postgres
+
+  # ---- フォールバック: REGISTER 仲介 (M1検証で必要と判断した場合のみ) ----
+  asterisk:
+    image: andrius/asterisk:20
+    profiles: ["asterisk"]
+    logging: *default-logging
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # ダイヤルプランから ${ENV(...)} で読む値 (2026-09-17)。
+      # extensions.conf は生成物ではなく静的ファイルなので、環境ごとに変わる値はここから渡す
+      # (番号を git 管理のファイルに焼くと OSS 公開時に漏れる)
+      PHONES_RING_SEC: ${PHONES_RING_SEC:-0}   # 内線を同時に鳴らす秒数。0/未設定なら内線を鳴らさない
+      OUTBOUND_CALLERID: ${OUTBOUND_CALLERID:-}  # 内線からの外線発信で名乗る番号
+      # スタンバイで端末を鳴らす秒数 (2026-09-18に固定値2から環境変数へ)。⚠hookd にも同じ値を渡すこと
+      STANDBY_RING_SEC: ${STANDBY_RING_SEC:-2}
+    volumes:
+      - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./asterisk/rtp.conf:/etc/asterisk/rtp.conf:ro
+      - ./asterisk/manager.conf:/etc/asterisk/manager.conf:ro
+      # 定型文の音声 (録音告知。infra/scripts/render_prompts.py で作る)。
+      # Playback(fragment/rec-notice) で引く。ディレクトリごとのマウントなので差し替えに追従する
+      - ./asterisk/sounds:/var/lib/asterisk/sounds/fragment:ro
+      # 相手に聞かせる呼び出し音 (保留音の仕組みでループ再生。musiconhold.conf の fragment-ringback)
+      - ./asterisk/musiconhold.conf:/etc/asterisk/musiconhold.conf:ro
+      - ./asterisk/moh:/var/lib/asterisk/moh-fragment:ro
+      # 通話録音の置き場 (MixMonitor の相対パスはここに解決される)。
+      # 挨拶で「この通話は録音されます」と告知している実体がこれ (2026-07-30に実装。
+      # それまでは告知だけで音声を残していなかった)。8kHzモノラルwavで約1MB/分
+      - ../data/recordings:/var/spool/asterisk/monitor
+
+volumes:
+  callagent-pgdata:
