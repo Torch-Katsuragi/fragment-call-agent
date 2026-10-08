@@ -23,9 +23,12 @@ import json
 import logging
 import os
 
+import asyncio
+
 import aiohttp
 
 import members
+import vertex
 
 log = logging.getLogger("presence")
 
@@ -78,8 +81,7 @@ async def rank(cands: list[dict], convo: list[tuple[str, str]]) -> list[dict]:
     ⚠並べ替えは補助。呼ぶ相手は本人が選ぶので、ここが外れても実害は「探す手間」だけ。
       だから待たせない (4 秒で諦める)
     """
-    key = os.environ.get("GOOGLE_API_KEY", "")
-    if len(cands) < 2 or not key or not convo:
+    if len(cands) < 2 or not vertex.available() or not convo:
         return cands
     model = os.environ.get("RANK_MODEL", "gemini-3.8-flash")
     lines = "\n".join(f"{i}. {c['name']}（担当: {c['role'] or 'なし'}）" for i, c in enumerate(cands))
@@ -92,10 +94,12 @@ async def rank(cands: list[dict], convo: list[tuple[str, str]]) -> list[dict]:
             "thinkingConfig": {"thinkingLevel": "low"},
         },
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     try:
+        # 呼び先は Vertex AI か AI Studio (vertex.py)。⚠トークンの取得は同期なので別スレッドで
+        headers = await asyncio.to_thread(vertex.headers)
+        url = vertex.url(f"models/{model}:generateContent")
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as s:
-            async with s.post(url, headers={"x-goog-api-key": key}, json=body) as r:
+            async with s.post(url, headers=headers, json=body) as r:
                 data = await r.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         out = json.loads(text)

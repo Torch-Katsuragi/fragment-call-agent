@@ -48,6 +48,11 @@ def env_for(t: dict) -> dict[str, str]:
     key = os.environ.get(f"TENANT_{t['id'].upper()}_GOOGLE_API_KEY")
     if key:
         env["GOOGLE_API_KEY"] = key
+    # AI の請求先 (2026-10-08、vertex.py)。<ID>_VERTEX_PROJECT (例 KUMIAI_VERTEX_PROJECT) があれば
+    # そのテナントの GCP プロジェクトで Gemini を呼ぶ。無ければ main と同じ (VERTEX_PROJECT のまま)
+    proj = os.environ.get(f"{t['id'].upper()}_VERTEX_PROJECT")
+    if proj and t["id"] != DEFAULT_ID:
+        env["VERTEX_PROJECT"] = proj
     owner = os.environ.get(f"TENANT_{t['id'].upper()}_OWNER_NAME")
     if owner is not None:
         env["OWNER_NAME"] = owner

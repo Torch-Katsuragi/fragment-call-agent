@@ -99,6 +99,10 @@ services:
       HOOKD_URL: http://hookd:8790
       # M2: AIコア (AI_CORE=live がデフォルト。cascade は賢いが遅い)
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      # AI の請求先 (2026-10-08、services/agent/vertex.py)。あれば Vertex AI (VM のサービスアカウントで認証)。
+      # テナントごとの請求先は <ID>_VERTEX_PROJECT (無ければ VERTEX_PROJECT のまま)
+      VERTEX_PROJECT: ${VERTEX_PROJECT:-}
+      KUMIAI_VERTEX_PROJECT: ${KUMIAI_VERTEX_PROJECT:-}
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
       ELEVEN_API_KEY: ${ELEVEN_API_KEY}
       AI_CORE: ${AI_CORE:-live}
@@ -214,6 +218,7 @@ services:
       PRIORITY_RING_SEC: ${PRIORITY_RING_SEC:-20}
       # 保留中に呼ぶ相手の候補を会話から並べ替える (presence.py、2026-09-26)。無ければ並べ替えずに返す
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      VERTEX_PROJECT: ${VERTEX_PROJECT:-}
       RANK_MODEL: ${RANK_MODEL:-gemini-3.8-flash}
       # テスト通話シミュレータがルーム作成+caller-simディスパッチに使う
       LIVEKIT_URL: ws://livekit:7880
@@ -277,6 +282,8 @@ services:
       SECURITY_LOCAL_NUMBERS: ${KUMIAI_SECURITY_LOCAL_NUMBERS:-}
       SECURITY_ALLOW_NUMBERS: ${KUMIAI_SECURITY_ALLOW_NUMBERS:-}
       SECURITY_WEBHOOK_URL: ${KUMIAI_SECURITY_WEBHOOK_URL:-}
+      # テナントの AI はテナントの GCP プロジェクトの請求で (2026-10-08)。無ければ main と同じ
+      VERTEX_PROJECT: ${KUMIAI_VERTEX_PROJECT:-${VERTEX_PROJECT:-}}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -303,6 +310,7 @@ services:
       OWNER_NAME: ${OWNER_NAME:-}   # 本人の呼び名 (AI への指示文・相手役のセリフ)。氏名をソースに書かないため .env から
       DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      VERTEX_PROJECT: ${VERTEX_PROJECT:-}
       # サーバーでは agy (Antigravity CLI) を使えないので Gemini 直呼び固定 (2026-07-17実測)
       DIRECTORY_AGENT_BACKEND: gemini
       # ⚠時刻は JST で書く (2026-10-02)。worker は astimezone() でローカル時刻にするので、
@@ -334,6 +342,7 @@ services:
       DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent_kumiai
       FRAGMENT_WORKSPACE: /tenants/kumiai/workspace
       HOOKD_URL: http://hookd-kumiai:8791
+      VERTEX_PROJECT: ${KUMIAI_VERTEX_PROJECT:-${VERTEX_PROJECT:-}}
     volumes:
       - ${TENANTS_HOST:-/home/fragment/tenants}/kumiai/workspace:/tenants/kumiai/workspace
       # テナントの通話の生の録音 (Asterisk が data/recordings/kumiai/ に書く)

@@ -9,7 +9,8 @@
   3. 通話の録音を ワークスペース/録音/ へ移し、管制室の指定で消す (recordings.py)
 
 起動: python services/directory-agent/worker.py  (リポジトリどこからでも可)
-環境変数: DATABASE_URL / GOOGLE_API_KEY (無ければリポジトリ直下の .env から読む)
+環境変数: DATABASE_URL / VERTEX_PROJECT か GOOGLE_API_KEY (無ければリポジトリ直下の .env から読む)。
+  Gemini の呼び先は vertex.py (VERTEX_PROJECT があれば Vertex AI、2026-10-08)
           FRAGMENT_WORKSPACE (デフォルト: ./workspace)
           DIRECTORY_AGENT_BACKEND = auto | agy | gemini
 """
@@ -33,6 +34,7 @@ import asyncpg
 
 import phonebook as pb
 import recordings
+import vertex
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("directory-agent")
@@ -74,7 +76,10 @@ _ENVF = _load_env_file()
 DSN = os.environ.get("DATABASE_URL") or _ENVF.get(
     "DATABASE_URL", "postgresql://callagent:callagent@localhost:5432/callagent"
 )
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY") or _ENVF.get("GOOGLE_API_KEY", "")
+# Gemini の呼び先 (vertex.py が環境変数を見る)。手元で動かすときは .env の値を使う
+for _k in ("GOOGLE_API_KEY", "VERTEX_PROJECT"):
+    if not os.environ.get(_k) and _ENVF.get(_k):
+        os.environ[_k] = _ENVF[_k]
 
 # 本人 (電話の持ち主) の呼び名。AI への指示文の {OWNER} に入る。
 # ⚠未設定なら「持ち主」。氏名をソースに書かない (公開リポジトリに載るため)
@@ -145,13 +150,7 @@ def call_gemini(
     if google_search:
         # Google検索グラウンディング (⚠json_modeとは併用不可)
         body["tools"] = [{"google_search": {}}]
-    req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-goog-api-key": GOOGLE_API_KEY},
-    )
-    with urllib.request.urlopen(req, timeout=60) as res:
-        data = json.loads(res.read().decode("utf-8"))
+    data = _gemini_rest("POST", f"models/{GEMINI_MODEL}:generateContent", body, timeout=60)
     # 使った量を残す (2026-10-02、費用の内訳を測るため)。cached = 暗黙キャッシュに当たった分 (安い)
     u = data.get("usageMetadata") or {}
     log.info(
@@ -666,14 +665,14 @@ _watch_cache: dict[str, tuple[int, str]] = {}  # call id → (前半の hash, "c
 WATCH_CACHE_TTL = "1800s"  # 通話より長く。終話を見たら消す (消し損ねても TTL で消える)
 
 
-def _gemini_rest(method: str, path: str, body: dict | None = None) -> dict:
+def _gemini_rest(method: str, path: str, body: dict | None = None, timeout: int = 30) -> dict:
     req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/{path}",
+        vertex.url(path),
         data=json.dumps(body).encode("utf-8") if body is not None else None,
         method=method,
-        headers={"Content-Type": "application/json", "x-goog-api-key": GOOGLE_API_KEY},
+        headers=vertex.headers(),
     )
-    with urllib.request.urlopen(req, timeout=30) as res:
+    with urllib.request.urlopen(req, timeout=timeout) as res:
         raw = res.read()
     return json.loads(raw) if raw else {}
 
@@ -687,7 +686,7 @@ def _watch_cache_for(call_key: str, prefix: str) -> str | None:
         _drop_watch_cache(call_key)
     try:
         c = _gemini_rest("POST", "cachedContents", {
-            "model": f"models/{GEMINI_MODEL}",
+            "model": vertex.model_name(GEMINI_MODEL),
             "systemInstruction": {"parts": [{"text": WATCHER_PROMPT}]},
             "contents": [{"role": "user", "parts": [{"text": prefix}]}],
             "ttl": WATCH_CACHE_TTL,

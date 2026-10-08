@@ -56,9 +56,16 @@ from livekit.agents import stt as lk_stt
 from livekit.agents.voice.room_io import RoomInputOptions
 from livekit.agents.llm import ChatMessage
 from livekit.plugins import deepgram, google, silero
+from livekit.plugins.google.realtime import realtime_api as _google_realtime
+
+# ⚠プラグインのモデル名の照合を外す (2026-10-08)。プラグインは gemini-3.8-live を「Gemini API 専用」と
+#   決め打ちで持っていて vertexai=True だと止めるが、Vertex AI (us-central1) でも実際に動く (音声が返るのを実測)。
+#   照合は名前の一覧との完全一致だけで、他の振る舞いには関わらない
+_google_realtime._validate_model_api_match = lambda model, use_vertexai: None
 
 import security
 import tenants as tenant_registry
+import vertex
 from aivis_tts import DEFAULT_MODEL_UUID as AIVIS_DEFAULT_MODEL
 from aivis_tts import AivisTTS
 from livekit.agents import tts as tts_mod
@@ -1132,6 +1139,13 @@ def _make_session(tts_primary: str | None = None, tts_fallback: str | None = Non
         #   思考を入れると遅延が増えるはずなので、電話では既定にしない。
         llm=google.beta.realtime.RealtimeModel(
             model=os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.8-live"),
+            # 請求先 (2026-10-08、vertex.py)。VERTEX_PROJECT があれば Vertex AI (VM のサービスアカウントで認証)、
+            # 無ければ GOOGLE_API_KEY。⚠Live は us-central1 にしか無い
+            **(
+                {"vertexai": True, "project": vertex.project(), "location": vertex.live_location()}
+                if vertex.project()
+                else {}
+            ),
             voice=os.environ.get("GEMINI_VOICE", "Leda"),
             language="ja-JP",
             # ⚠相手の声の文字起こしも日本語に固定する (2026-09-29)。既定は言語の自動判定で、
