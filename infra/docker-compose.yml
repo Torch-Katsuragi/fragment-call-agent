@@ -108,6 +108,8 @@ services:
       AI_CORE: ${AI_CORE:-live}
       # live の VAD (2026-10-02、試験中): silero (既定) / webrtc (軽い、services/agent/webrtc_vad.py)
       LIVE_VAD: ${LIVE_VAD:-silero}
+      # 保留が続いたら AI が引き取るまでの秒数 (空 = 60)。自分で出るモードでは引き取らない (2026-10-08)
+      HOLD_TIMEOUT_SEC: ${HOLD_TIMEOUT_SEC:-}
       # 先に立ち上げておく通話プロセスの数 (空 = ライブラリの既定 = CPU 数)。VM を 2GB にするなら 1
       NUM_IDLE_PROCESSES: ${NUM_IDLE_PROCESSES:-}
       GEMINI_VOICE: ${GEMINI_VOICE:-Leda}

@@ -464,7 +464,7 @@ async def handoff_decline(req: web.Request) -> web.Response:
     device = req.query.get("device", "")
     if st.get("manual") and device:
         # 人が呼んだ呼び出しは、断った端末だけ鳴り止む。宛先が全員断ったら終わり
-        # (保留は続く。保留が長引けば agent が AI に渡す)
+        # (保留は続く。保留が長引けば agent が AI に渡す。自分で出るモードでは渡さない)
         st["declined_by"].append(device)
         if st["targets"] and set(st["targets"]) <= set(st["declined_by"]):
             st["declined"] = True

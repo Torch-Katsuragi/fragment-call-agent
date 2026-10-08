@@ -1229,6 +1229,20 @@ async def _owner_picked_up(number: str) -> bool | None:
         return None
 
 
+async def _answer_mode() -> str | None:
+    """いまの応答モード (hookd /answer_mode、時間割込み)。None = hookd に届かなかった"""
+    base = os.environ.get("HOOKD_URL", "http://host.docker.internal:8790")
+    try:
+        import aiohttp
+
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{base}/answer_mode", timeout=aiohttp.ClientTimeout(total=2)) as r:
+                return (await r.text()).strip() or None
+    except Exception:
+        logger.exception("answer_mode の問い合わせに失敗")
+        return None
+
+
 def _apply_tenant(room: str) -> str:
     """部屋名からテナント (管制室) を決め、その DB・作業フォルダ・hookd・名乗りに切り替える (2026-10-04)。
     ⚠通話 1 本ごとに別プロセスなので、ここで環境とモジュールの値を書き換えてよい
@@ -1897,6 +1911,13 @@ async def entrypoint(ctx: JobContext):
         await asyncio.sleep(HOLD_TIMEOUT_SEC)
         ctl["hold_timer"] = None  # ⚠_apply が自分を cancel しないように先に外す
         if ctl["handler"] != "hold":
+            return
+        # ⚠「自分で出る」の間は AI が引き取らない (2026-10-08 ユーザー)。保留のまま見張り直し、
+        #   モードが変わっていたら次の区切りで引き取る。「AIに任せる」を押したときは従来どおり AI が出る
+        if await _answer_mode() == "manual":
+            logger.info("保留が %.0f 秒続いたが自分で出るモード — AI は引き取らない", HOLD_TIMEOUT_SEC)
+            if ctl["handler"] == "hold" and ctl["hold_timer"] is None:
+                ctl["hold_timer"] = asyncio.create_task(_hold_timeout())
             return
         logger.info("保留が %.0f 秒続いた — AI が引き取る", HOLD_TIMEOUT_SEC)
         ctl["ai_on"] = True

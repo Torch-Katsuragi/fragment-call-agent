@@ -59,7 +59,7 @@ object CallCoordinator {
         val announcing: Boolean = false,
         /**
          * 保留中に人が呼んだ (2026-09-26)。by = 呼んだ端末の名前。AI の取り次ぎと違い、断っても
-         * AI は何もしない (保留が続き、長引けば AI が引き取る)
+         * AI は何もしない (保留が続き、長引けば AI が引き取る。自分で出るモードでは引き取らない)
          */
         val manual: Boolean = false,
         val by: String = "",
