@@ -60,6 +60,7 @@ object CallNotifications {
                 when {
                     announcing -> "録音告知中…"
                     isCall -> "着信 · 出なければAIが預かります"
+                    inc.manual -> "${inc.by.ifEmpty { "ほかの端末" }}から保留中の通話です"
                     else -> "AIが応対中の通話に呼ばれています"
                 }
             )
@@ -77,7 +78,11 @@ object CallNotifications {
         b.addAction(
             Notification.Action.Builder(
                 null,
-                if (isCall) "AIに任せる" else "AIに続けさせる",
+                when {
+                    isCall -> "AIに任せる"
+                    inc.manual -> "出られない"
+                    else -> "AIに続けさせる"
+                },
                 action(3, CallActionReceiver.ACTION_TO_AI),
             ).build()
         )
@@ -103,12 +108,14 @@ object CallNotifications {
      */
     fun showOngoing(
         context: Context,
-        callId: String,
-        who: String,
+        call: jp.sleeptree.fragment.api.FragmentApi.ActiveCall,
         liveDisplay: String = Prefs.LIVE_NONE,
-        answered: Boolean = false,
+        talking: Boolean = false,
+        fullScreen: Boolean = false,
     ) {
         val nm = context.getSystemService(NotificationManager::class.java) ?: return
+        val callId = call.id
+        val who = call.name ?: call.number.ifEmpty { "非通知" }
         val open = PendingIntent.getActivity(
             context, 3,
             MainActivity.callIntentById(context, callId).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -117,18 +124,35 @@ object CallNotifications {
         // 「AI応対中の表示」あり → full-screen intent で LiveCallActivity を出す (ロック中・画面OFFのとき)。
         //   ⚠常駐サービスから直接 startActivity するとバックグラウンド起動として止められるので、
         //     通知の full-screen intent に載せる。チャンネルは IMPORTANCE_HIGH が要る (FragmentApp)
-        val live = !answered && liveDisplay != Prefs.LIVE_NONE
+        val live = fullScreen && !talking && liveDisplay != Prefs.LIVE_NONE
         val b = Notification.Builder(context, if (live) FragmentApp.CHANNEL_LIVE else FragmentApp.CHANNEL_ONGOING)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("通話中 · $who")
-            .setContentText(if (answered) "あなたが応対しています" else "AIが応対しています")
+            .setContentTitle(if (talking) "通話中 · $who" else "${call.handlerLabel} · $who")
+            .setContentText(
+                when {
+                    talking -> "あなたが話しています"
+                    call.handler == "hold" -> "相手は保留音を聞いています"
+                    else -> "開くと会話を見られます"
+                }
+            )
             .setCategory(Notification.CATEGORY_CALL)
             .setOngoing(true)
+            // 見出しが変わるたびに出し直すので、鳴らしたり飛び出したりするのは最初の1回だけ
+            .setOnlyAlertOnce(true)
             .setContentIntent(open)
             // ⚠ロック画面には出さない (2026-09-19 ユーザー「自動応答はサイレントでバックグラウンドで」)。
             //   AIが受けている間、端末は何も見せない。ロックを解けば通知シェードにはある
             .setVisibility(Notification.VISIBILITY_SECRET)
-        if (answered) {
+        if (!talking) {
+            // 待機・視聴から会話に入る口 (2026-09-26)。⚠ロック中は解除を求められる (Activity を開く操作なので)
+            val talk = PendingIntent.getActivity(
+                context, 6,
+                MainActivity.callIntent(context, call.room).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            b.addAction(Notification.Action.Builder(null, "話す", talk).build())
+        }
+        if (talking) {
             // 自分が出ている通話を切る口 (2026-09-24 ユーザー「スマホから通話を切る方法がわからん」)。
             //   通話画面の下のバーにもあるが、画面を離れても切れるようにここにも置く
             val hang = PendingIntent.getBroadcast(

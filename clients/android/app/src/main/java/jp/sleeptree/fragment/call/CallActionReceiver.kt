@@ -24,14 +24,9 @@ class CallActionReceiver : BroadcastReceiver() {
             // ⚠2026-09-24 まではここが端末のタイマーを動かすだけで、**サーバーの応答モードを
             //   変えていなかった**。アプリ上部の切替 (これはサーバーに送っていた) を撤去した日に、
             //   常駐通知からモードを変える手段が実質無くなっていた
-            ACTION_STANDBY_EXTEND -> {
-                Prefs(context).startStandby()
-                setMode(context, "standby")
-            }
-            ACTION_STANDBY_STOP -> {
-                Prefs(context).clearStandby()
-                setMode(context, "away")
-            }
+            // 時限 (8 時間・時間割への戻り) はサーバーが持つ (2026-09-29)
+            ACTION_STANDBY_EXTEND -> setMode(context, "standby")
+            ACTION_STANDBY_STOP -> setMode(context, "away")
             ACTION_HANGUP -> CallCoordinator.hangup(context)
             ACTION_PAUSE -> DevicePause.set(context, true)
             ACTION_RESUME -> DevicePause.set(context, false)

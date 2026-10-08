@@ -9,7 +9,8 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ id: string
   const { id } = await ctx.params;
   try {
     const call = await pool.query<CallRow>(
-      `SELECT id, caller_number, room_name, started_at, ended_at, direction
+      `SELECT id, caller_number, room_name, started_at, ended_at, direction,
+              handler, ai_on, hold_since, presence, caller_label, recording_path, handled_by
        FROM calls WHERE id = $1`,
       [id],
     );

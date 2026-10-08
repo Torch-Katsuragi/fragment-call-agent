@@ -14,8 +14,8 @@ Doze で止まる (据え置き・常時給電なら要らない)。メイン端
   ・受ける側 (アプリ): 管制室の /api/device/config が配る FCM_ANDROID_* (lib/env.ts)
   どちらも未設定なら黙って何もしない (ロングポーリングのみ)。
 
-⚠トークンは Postgres の device_push_tokens。アプリが /api/device/push で登録し、
-  FCM が UNREGISTERED を返したらここで消す (端末のアンインストール・再インストール)。
+⚠トークンはログインの行 (device_sessions.push_token、2026-10-04)。アプリが /api/device/push で登録し、
+  FCM が UNREGISTERED を返したらここで消す (端末のアンインストール・再インストール)。ログアウトでも消える
 """
 
 import asyncio
@@ -26,19 +26,13 @@ import time
 
 import aiohttp
 
+import members
+
 log = logging.getLogger("push")
 
-DDL = """
-CREATE TABLE IF NOT EXISTS device_push_tokens (
-  token       text PRIMARY KEY,
-  name        text NOT NULL DEFAULT '',
-  platform    text NOT NULL DEFAULT 'android',
-  created_at  timestamptz NOT NULL DEFAULT now(),
-  updated_at  timestamptz NOT NULL DEFAULT now()
-);
--- 端末ごとの一時停止 (2026-09-24)。true の端末には「起きろ」を送らない
-ALTER TABLE device_push_tokens ADD COLUMN IF NOT EXISTS paused boolean NOT NULL DEFAULT false;
-"""
+# ⚠宛先 (FCM トークン) と一時停止はログイン (device_sessions.push_token / paused) に持つ (2026-10-04)。
+#   表は members.DDL が作る。以前の device_push_tokens はそこで移して消す
+DDL = ""
 
 SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 # 着信は数秒で終わる。届かなかったプッシュを後で配られても鳴らす相手がいない
@@ -94,26 +88,43 @@ async def listeners(pool) -> tuple[int, int]:
     ⚠読めなければ (0, 0) = 「端末の登録が無い」扱い。呼び出し側は従来どおりに動く (fail-open)"""
     try:
         row = await pool.fetchrow(
-            "SELECT count(*) AS total, count(*) FILTER (WHERE NOT paused) AS active "
-            "FROM device_push_tokens"
+            "SELECT count(DISTINCT s.device_id) AS total, "
+            "count(DISTINCT s.device_id) FILTER (WHERE NOT s.paused) AS active "
+            f"FROM {members.ACTIVE_SESSIONS} WHERE s.push_token IS NOT NULL"
         )
         return int(row["total"]), int(row["active"])
     except Exception:
-        log.exception("device_push_tokens の集計に失敗")
+        log.exception("起こす宛先の集計に失敗")
         return 0, 0
 
 
-async def wake(pool, kind: str) -> None:
-    """登録済みの全端末に「起きろ」を送る。kind は ring / handoff (端末側のログ用)。
+async def wake(
+    pool, kind: str, device_ids: list[str] | None = None, exclude: list[str] | None = None
+) -> None:
+    """登録済みの端末に「起きろ」を送る。kind は ring / handoff (端末側のログ用)。
+    device_ids を渡すとその端末だけ (保留中に相手を指定して呼ぶとき、2026-09-26)。
+    exclude の端末には送らない (受付時間外の人、2026-09-29)。
 
     ⚠失敗しても呼び出し元を止めない (鳴らす経路の本線はロングポーリング)。
     """
     if not _load():
         return
     try:
-        rows = await pool.fetch("SELECT token FROM device_push_tokens WHERE NOT paused")
+        if device_ids:
+            rows = await pool.fetch(
+                f"SELECT DISTINCT s.push_token AS token FROM {members.ACTIVE_SESSIONS} "
+                "WHERE s.push_token IS NOT NULL AND NOT s.paused AND s.device_id = ANY($1::text[])",
+                device_ids,
+            )
+        else:
+            # 宛先はいま有効なログインのものだけ (ログアウト・締め出しで消える、2026-10-04)
+            rows = await pool.fetch(
+                f"SELECT DISTINCT s.push_token AS token FROM {members.ACTIVE_SESSIONS} "
+                "WHERE s.push_token IS NOT NULL AND NOT s.paused AND NOT s.device_id = ANY($1::text[])",
+                [x for x in exclude or [] if x],
+            )
     except Exception:
-        log.exception("device_push_tokens が読めない")
+        log.exception("起こす宛先が読めない")
         return
     if not rows:
         return
@@ -155,7 +166,7 @@ async def _send_one(http, url, headers, pool, token: str, kind: str) -> bool:
     if res.status in (400, 404) and ("UNREGISTERED" in text or "INVALID_ARGUMENT" in text):
         log.info("FCM トークン失効 → 削除 (%s…)", token[:12])
         try:
-            await pool.execute("DELETE FROM device_push_tokens WHERE token = $1", token)
+            await pool.execute("UPDATE device_sessions SET push_token = NULL WHERE push_token = $1", token)
         except Exception:
             log.exception("失効トークンの削除に失敗")
     else:

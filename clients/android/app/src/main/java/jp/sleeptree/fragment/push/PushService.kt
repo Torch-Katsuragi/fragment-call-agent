@@ -47,6 +47,7 @@ class PushService : FirebaseMessagingService() {
         }
         val st = FragmentApi(prefs).deviceState() ?: return
         ServerState.setAnswerMode(st.answerMode)
+        ServerState.setModeInfo(st.modeInfo)
         val h = st.handoff
         val inc = st.incoming
         when {

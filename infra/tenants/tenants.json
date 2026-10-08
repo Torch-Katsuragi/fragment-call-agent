@@ -1,0 +1,29 @@
+{
+  "_説明": "テナント (管制室) の台帳 (2026-10-04)。VM 1 台に複数の管制室を同居させる。設計は Vault の 1_製品/同居構成_開発記録。秘密は書かない (鍵の差し替えは .env の TENANT_<ID>_GOOGLE_API_KEY)",
+  "tenants": [
+    {
+      "id": "main",
+      "label": "本人",
+      "room_prefix": "call",
+      "sip_number": "call-agent",
+      "database": "callagent",
+      "hookd": "http://hookd:8790",
+      "hookd_host_port": 8790,
+      "workspace_host": "/srv/fragment/workspace",
+      "workspace_container": "/fragment",
+      "dashboard_port": 3000
+    },
+    {
+      "id": "kumiai",
+      "label": "2 つ目のテナント",
+      "room_prefix": "kumiai",
+      "sip_number": "kumiai",
+      "database": "callagent_kumiai",
+      "hookd": "http://hookd-kumiai:8791",
+      "hookd_host_port": 8791,
+      "workspace_host": "/home/fragment/tenants/kumiai/workspace",
+      "workspace_container": "/tenants/kumiai/workspace",
+      "dashboard_port": 3001
+    }
+  ]
+}

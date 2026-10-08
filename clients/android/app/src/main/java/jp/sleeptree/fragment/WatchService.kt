@@ -44,7 +44,8 @@ class WatchService : Service() {
     private var ongoingRoom: String? = null
 
     /** いまの「通話中」カードが「自分が出ている」版か。出た瞬間に描き直す (通話終了ボタンを付ける) */
-    private var ongoingAnswered = false
+    /** 通知に出している中身 (ルーム・見出し・自分が会話中か)。変わったら出し直す */
+    private var ongoingKey: String? = null
 
     /** ロングポーリングの継続に使う指紋。⚠通信に失敗しても捨てない (同じ状態を取り直すだけ) */
     private var lastV: String = ""
@@ -100,20 +101,13 @@ class WatchService : Service() {
 
     /** @return サーバーから状態を取れたか (取れなかったら少し待って張り直す) */
     private fun tick(): Boolean {
-        // スタンバイの期限切れ。⚠ここで落とすのは「切り忘れ」対策であって、
-        //   アプリの起動状態から推測しているわけではない (Prefs の注記参照)
-        if (prefs.standbyUntil != 0L && !prefs.isStandby) {
-            prefs.clearStandby()
-            api.setAnswerMode("away")
-            updateWatchNotification()
-        }
-
         if (!prefs.isConfigured) return false
         val state = api.deviceState(waitSec = WAIT_SEC, since = lastV) ?: return false
         lastV = state.v
         // ⚠応答モードの正はサーバー。管制室から切り替えられることがあるので、
         //   端末のスタンバイタイマーだけを見て表示を作らない (ズレる)
         ServerState.setAnswerMode(state.answerMode)
+        ServerState.setModeInfo(state.modeInfo)
         updateWatchNotification()
 
         // --- 呼び出し ---
@@ -134,26 +128,32 @@ class WatchService : Service() {
                 CallCoordinator.expire(this)
         }
 
-        // --- 「通話中」の通知 ---
-        // ⚠AI が応対しているだけの間は出さない (2026-09-25 ユーザー「通話中カードはやめて」)。
-        //   出すのは、本人が出た通話 (「通話終了」ボタンの置き場) と、
-        //   「AI応対中の表示」を設定でオンにしているとき (その画面を起こす full-screen intent の器) だけ
+        // --- 「通話中」の通知 = 待機中の入口 (2026-09-26) ---
+        // 通話があれば、どの端末にも音の出ない通知を1枚出す (ロック画面には出さない)。見出しは担い手
+        // 「AIが応対中」「〇〇が応対中」「保留中」で、押せば視聴、「話す」で会話に入る。
+        // ⚠2026-09-25 に「AI 応対中の通話中カードはやめて」で一度消したが、全端末が待機・視聴・会話を
+        //   行き来できるようにしたので入口として戻した (ユーザー了承済み、通知欄だけ)。
+        // ⚠自分が会話中かはサーバーの参加者 (presence) で見る。入った直後はまだ載っていないので
+        //   手元の接続状態も見る
         val active = state.activeCall
         ServerState.setActiveCall(active)
-        val answered = CallCoordinator.answeredByUser
-        if (active != null && (active.room != ongoingRoom || answered != ongoingAnswered)) {
-            ongoingRoom = active.room
-            ongoingAnswered = answered
-            // 本人が出た通話には「AI応対中の表示」を被せない (管制室が既に前面にいる)
-            val live = if (answered) Prefs.LIVE_NONE else prefs.liveDisplay
-            if (answered || live != Prefs.LIVE_NONE) {
-                CallNotifications.showOngoing(this, active.id, active.name ?: active.number, live, answered)
-            } else {
-                CallNotifications.cancelOngoing(this)
+        if (active != null) {
+            val audio = jp.sleeptree.fragment.audio.CallAudio.state.value
+            val talking = active.presence.any { it.id == prefs.deviceId && it.role == "talk" } ||
+                (audio.operator && audio.room == active.room)
+            val key = "${active.room}|${active.handlerLabel}|$talking"
+            if (key != ongoingKey) {
+                // 「AI応対中の表示」(ロック画面の全画面) を起こすのは、通話が現れた最初の1回だけ。
+                // 見出しが変わるたびに起こすと、ロック中の画面が何度も点く
+                val first = active.room != ongoingRoom
+                ongoingRoom = active.room
+                ongoingKey = key
+                val live = if (talking) Prefs.LIVE_NONE else prefs.liveDisplay
+                CallNotifications.showOngoing(this, active, live, talking, fullScreen = first)
             }
-        } else if (active == null && ongoingRoom != null) {
+        } else if (ongoingRoom != null) {
             ongoingRoom = null
-            ongoingAnswered = false
+            ongoingKey = null
             // 相手が切った・管制室で切った。OS に通話終了を伝える (応答後の Connection を残さない)
             CallCoordinator.onCallEnded()
             jp.sleeptree.fragment.audio.CallAudio.endAll()
@@ -194,7 +194,8 @@ class WatchService : Service() {
 
     /**
      * 常駐通知。**スタンバイの残り時間をここに出し、延長と解除もここからできる**
-     * (2026-07-31の決定: 時限つき + 常駐通知から延長)。
+     * (2026-07-31の決定: 時限つき + 常駐通知から延長)。2026-09-29 から時限と時間割はサーバーが持ち、
+     * ここは次の切り替わり (ServerState.modeInfoText) を出すだけ。
      */
     private fun buildWatchNotification(): Notification {
         val open = PendingIntent.getActivity(
@@ -217,28 +218,30 @@ class WatchService : Service() {
         }
         val pause = action(14, "一時停止", CallActionReceiver.ACTION_PAUSE)
 
-        // ⚠表示するモードはサーバーの値。取れていない間だけ端末のタイマーで代用する
-        when (ServerState.answerMode.value ?: if (prefs.isStandby) "standby" else "away") {
+        // ⚠表示するモードはサーバーの値。時限と時間割の次の切り替わりもサーバーが返す (2026-09-29)
+        val sched = ServerState.modeInfoText(ServerState.modeInfo.value)
+        when (ServerState.answerMode.value ?: "away") {
             "standby" -> {
-                val mins = prefs.standbyRemainingMs / 60000
                 b.setContentTitle("スタンバイ中")
-                    .setContentText(
-                        if (mins > 0) "あと ${mins / 60}時間${mins % 60}分 · 数秒鳴らします"
-                        else "数秒鳴らして、出なければAIが応対します"
-                    )
-                    .addAction(action(11, "延長", CallActionReceiver.ACTION_STANDBY_EXTEND))
+                    .setContentText(sched ?: "数秒鳴らして、出なければAIが応対します")
+                    .apply {
+                        // 延長 = 8 時間を数え直す。時間割のときは時間割が区切るので出さない
+                        if (ServerState.modeInfo.value?.scheduleEnabled != true) {
+                            addAction(action(11, "延長", CallActionReceiver.ACTION_STANDBY_EXTEND))
+                        }
+                    }
                     .addAction(action(12, "解除", CallActionReceiver.ACTION_STANDBY_STOP))
                     .addAction(pause)
             }
             "manual" -> {
                 b.setContentTitle("自分で出る")
-                    .setContentText("AIは応答しません")
+                    .setContentText(sched ?: "AIは応答しません")
                     .addAction(action(12, "スタンバイに戻す", CallActionReceiver.ACTION_STANDBY_EXTEND))
                     .addAction(pause)
             }
             else -> {
                 b.setContentTitle("不在")
-                    .setContentText("AIが用件を預かります")
+                    .setContentText(sched ?: "AIが用件を預かります")
                     .addAction(action(11, "スタンバイ", CallActionReceiver.ACTION_STANDBY_EXTEND))
                     .addAction(pause)
             }

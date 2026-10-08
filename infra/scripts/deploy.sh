@@ -66,7 +66,8 @@ if [ -z "$targets" ]; then
     case "$CHANGED" in *services/agent/*|*infra/docker-compose.yml*) targets="$targets agent";; esac
     # ⚠hookd.py と security.py は services/agent/ に置かれているが、動いているのは
     #   別コンテナ (infra-hookd-1)。agent だけ再起動して hookd が古いまま、を実際に踏んだ
-    case "$CHANGED" in *services/agent/hookd.py*|*services/agent/security.py*|*infra/docker-compose.yml*) targets="$targets hookd";; esac
+    # ⚠hookd が import しているもの (presence.py は起動時に DDL を流す、push.py) も (2026-09-26 に列が入らず踏んだ)
+    case "$CHANGED" in *services/agent/hookd.py*|*services/agent/security.py*|*services/agent/presence.py*|*services/agent/members.py*|*services/agent/push.py*|*services/agent/schedule.py*|*services/agent/requirements.txt*|*infra/docker-compose.yml*) targets="$targets hookd";; esac
     case "$CHANGED" in *infra/asterisk/*) targets="$targets asterisk";; esac
     case "$CHANGED" in *services/directory-agent/*) targets="$targets worker";; esac
   fi
@@ -114,8 +115,9 @@ fi
 
 svc=''
 [ \"\$t\" != \"\${t/ agent /}\" ] && svc=\"\$svc agent\"
-[ \"\$t\" != \"\${t/ hookd /}\" ] && svc=\"\$svc hookd\"
-[ \"\$t\" != \"\${t/ worker /}\" ] && svc=\"\$svc directory-agent\"
+# ⚠テナントごとの hookd・worker (hookd-kumiai 等、2026-10-04 の同居構成) も同じコードなので一緒に作り直す
+[ \"\$t\" != \"\${t/ hookd /}\" ] && svc=\"\$svc hookd \$(cd infra && sudo docker compose --profile vm-worker config --services 2>/dev/null | grep '^hookd-' | tr '\n' ' ')\"
+[ \"\$t\" != \"\${t/ worker /}\" ] && svc=\"\$svc directory-agent \$(cd infra && sudo docker compose --profile vm-worker config --services 2>/dev/null | grep '^directory-agent-' | tr '\n' ' ')\"
 if [ -n \"\$svc\" ]; then
   echo \"--- 再ビルド:\$svc ---\"
   (cd infra && sudo docker compose --env-file ../.env --profile asterisk --profile vm-worker --profile testcall up -d --build \$svc 2>&1 | tail -3)
@@ -129,6 +131,11 @@ if [ -n \"\$svc\" ]; then
     c=\$(sudo docker exec \$cont md5sum \$cpath | cut -d' ' -f1)
     [ \"\$h\" = \"\$c\" ] && echo \"  OK \$hpath\" || { echo \"  ✗ \$hpath が \$cont に反映されていない\"; exit 1; }
   done
+  # ⚠ビルドの残りを片付ける (2026-10-02)。ディスクを 50→20GB に縮めたので、放っておくと
+  #   デプロイのたびに溜まるビルドキャッシュ (縮める前は 9GB あった) で埋まる。1 週間より古い分だけ消す
+  sudo docker builder prune -f --filter until=168h >/dev/null 2>&1 || true
+  sudo docker image prune -f >/dev/null 2>&1 || true
+  echo \"  ディスク: \$(df -h / | awk 'NR==2{print \$3\"/\"\$2}')\"
 fi
 
 if [ \"\$t\" != \"\${t/ dashboard /}\" ]; then
@@ -136,9 +143,11 @@ if [ \"\$t\" != \"\${t/ dashboard /}\" ]; then
   # ⚠install を忘れると package.json に依存を足したデプロイでビルドが壊れる
   #   (qrcode 追加 2026-08-01 が最初の該当)。依存に変化が無ければ一瞬で終わる
   (cd services/dashboard && npm install --no-audit --no-fund 2>&1 | tail -1 && npm run build 2>&1 | tail -3)
-  sudo systemctl restart call-agent-dashboard
+  # テナントごとの管制室 (call-agent-dashboard-kumiai 等、2026-10-04) も同じビルドなので全部再起動する
+  units=\$(systemctl list-units --all --plain --no-legend 'call-agent-dashboard*' | awk '{print \$1}')
+  sudo systemctl restart \$units
   sleep 4
-  systemctl is-active call-agent-dashboard
+  for u in \$units; do echo \"  \$u: \$(systemctl is-active \$u)\"; done
 fi
 
 echo '--- 稼働確認 ---'

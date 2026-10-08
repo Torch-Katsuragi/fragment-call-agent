@@ -1,0 +1,29 @@
+[Unit]
+Description=Call-Agent Dashboard (Next.js) — 2 つ目のテナントの管制室
+# 同居構成 (2026-10-04)。main の管制室 (call-agent-dashboard、3000) と同じビルドを、
+# ポートと環境変数を変えてもう 1 つ動かす。入口は同じ fragment.example.com で、Caddy が振り分ける
+# (infra/caddy/Caddyfile)。値は infra/tenants/tenants.json と揃えること
+After=network.target
+
+[Service]
+Type=simple
+User=fragment
+WorkingDirectory=/home/fragment/call-agent-src/services/dashboard
+Environment=TENANT_ID=kumiai
+Environment=ROOM_PREFIX=kumiai
+Environment=PORT=3001
+Environment=DATABASE_URL=postgresql://callagent:callagent@127.0.0.1:5432/callagent_kumiai
+Environment=FRAGMENT_WORKSPACE=/home/fragment/tenants/kumiai/workspace
+Environment=HOOKD_URL=http://127.0.0.1:8791
+Environment=LIVEKIT_URL=ws://127.0.0.1:7880
+Environment=LIVEKIT_PUBLIC_URL=wss://livekit.example.com
+# 最初のオーナー (テナントのメンバー表が空でも入れるように)。テナントの人は管制室の「メンバー」から招待する
+Environment=ALLOWED_EMAILS=your-account@gmail.com
+Environment=TENANT_LINE_LABEL=Twilio（テナントの代表番号）
+Environment=TENANT_LINE_NUMBER=
+ExecStart=/usr/bin/npm run start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

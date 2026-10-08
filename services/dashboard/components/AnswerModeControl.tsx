@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import type { ModeInfo } from "@/lib/answerMode";
 
 // 応答モードの3択スイッチ。2026-08-01に留守電ON/OFFの2値から広げた。
 //
@@ -18,14 +19,44 @@ export const ANSWER_MODE_UI = [
   { key: "manual", label: "自分で出る", desc: "AIは出ません。出るまで鳴らします" },
 ] as const;
 
+/** 時間割の状態を一行で (2026-09-29)。例「時間割 · 17:00 に不在へ」「手動 · 明日 8:00 に時間割へ戻る」 */
+export function modeInfoText(info: ModeInfo): string {
+  const label = (m: string | null) => ANSWER_MODE_UI.find((x) => x.key === m)?.label ?? "";
+  const at = info.next_at ? whenText(info.next_at * 1000) : "";
+  if (info.source === "manual") {
+    return info.schedule_enabled
+      ? `手動で切り替え中 · ${at} に時間割へ戻ります`
+      : `${at} に${label(info.next_mode)}へ戻ります`;
+  }
+  if (info.source === "schedule") {
+    return at ? `時間割どおり · ${at} に${label(info.next_mode)}へ` : "時間割どおり";
+  }
+  return "時間割は使っていません";
+}
+
+function whenText(ms: number): string {
+  const d = new Date(ms);
+  const now = new Date();
+  const hm = `${d.getHours()}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const day = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.round((day(d) - day(now)) / 86400000);
+  if (diff === 0) return hm;
+  if (diff === 1) return `明日 ${hm}`;
+  return `${d.getMonth() + 1}/${d.getDate()}(${"日月火水木金土"[d.getDay()]}) ${hm}`;
+}
+
 export function useAnswerMode() {
   const [mode, setMode] = useState<string | null>(null);
+  const [info, setInfo] = useState<ModeInfo | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     fetch("/api/settings", { cache: "no-store" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("settings"))))
-      .then((d) => setMode(d.answer_mode ?? (d.assistant_enabled ? "away" : "manual")))
+      .then((d) => {
+        setMode(d.answer_mode ?? (d.assistant_enabled ? "away" : "manual"));
+        setInfo(d.mode_info ?? null);
+      })
       .catch(() => setMode(null));
   }, []);
 
@@ -40,8 +71,11 @@ export function useAnswerMode() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ answer_mode: next }),
       });
-      if (res.ok) setMode((await res.json()).answer_mode);
-      else setMode(prev);
+      if (res.ok) {
+        const d = await res.json();
+        setMode(d.answer_mode);
+        if (d.mode_info) setInfo(d.mode_info);
+      } else setMode(prev);
     } catch {
       setMode(prev);
     } finally {
@@ -49,7 +83,7 @@ export function useAnswerMode() {
     }
   };
 
-  return { mode, busy, choose };
+  return { mode, info, busy, choose };
 }
 
 /**

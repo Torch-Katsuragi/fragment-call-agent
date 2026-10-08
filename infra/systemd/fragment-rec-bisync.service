@@ -1,0 +1,17 @@
+[Unit]
+Description=Fragment recordings bisync (Google Drive <-> VM)
+# 録音 (フラグメント/録音/) だけの双方向同期 (2026-10-02)。
+# worker が通話の録音を Ogg にしてここへ置き、管制室・Obsidian・Drive のどこからでも消せる。
+# ⚠消すのはユーザーで、期間を指定してまとめて消すので --max-delete は掛けない (100%)。
+#   代わりに --check-access: 両側に RCLONE_TEST が無ければ止まる
+#   (片側が空に見えたとき = マウント外れや取り違え、に全部消しに行かない)
+# 初回と壊れたとき:
+#   sudo -u fragment rclone bisync 'gdrive:fragment/録音' \
+#     '/srv/fragment/workspace/録音' --check-access --resync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=fragment
+ExecStart=/usr/bin/rclone bisync "gdrive:fragment/録音" "/srv/fragment/workspace/録音" --check-access --max-delete 100 --conflict-resolve newer --resilient --recover --max-lock 2m

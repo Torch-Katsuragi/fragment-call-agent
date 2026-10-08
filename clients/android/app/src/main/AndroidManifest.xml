@@ -41,19 +41,30 @@
             </intent-filter>
         </activity>
 
-        <!-- 接続先と端末トークンの設定。初回起動時のみ。
-             deep link `fragment://pair?url=...&token=...` で欄を埋められる (2026-09-18)。
-             ⚠exported=true が要るのはこのため。値は欄に入るだけで、保存は本人が押す
-               (SetupActivity.kt の注記)。adb の input text が日本語 IME で化けるための逃げ道 -->
+        <!-- ログイン (2026-09-26 から Google アカウント。旧式のペアリングと fragment://pair はやめた) -->
         <activity
             android:name=".ui.SetupActivity"
+            android:exported="false"
+            android:label="@string/setup_title" />
+
+        <!-- 招待から参加する (2026-09-26、JoinActivity.kt)。
+             https の方は App Links (管制室の /.well-known/assetlinks.json と結ぶ)。⚠自分の管制室を
+             別のドメインで立てる人は、ここのホストを変えてビルドする (fragment:// の方はどこでも効く) -->
+        <activity
+            android:name=".ui.JoinActivity"
             android:exported="true"
-            android:label="@string/setup_title">
+            android:label="フラグメントへの招待">
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="fragment.example.com" android:pathPrefix="/invite/" />
+            </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="fragment" android:host="pair" />
+                <data android:scheme="fragment" android:host="invite" />
             </intent-filter>
         </activity>
 

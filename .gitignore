@@ -11,7 +11,8 @@ __pycache__/
 node_modules/
 .next/
 tsconfig.tsbuildinfo
-recordings/
+# 録音はルートの recordings/ だけ。⚠`recordings/` と書くと管制室の app/api/recordings/ まで無視される (2026-10-02 に踏んだ)
+/recordings/
 data/
 # VM の .env の写し (dev_agent.sh が使う)。秘密なので絶対にコミットしない
 .env.vm

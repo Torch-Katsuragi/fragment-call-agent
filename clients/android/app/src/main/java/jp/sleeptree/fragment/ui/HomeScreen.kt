@@ -1,5 +1,12 @@
 package jp.sleeptree.fragment.ui
 
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.material3.SmallFloatingActionButton
+import androidx.compose.material.icons.rounded.ArrowUpward
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -24,6 +31,7 @@ import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.NotificationsOff
+import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PhoneInTalk
 import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.material3.Button
@@ -78,27 +86,59 @@ val MODES = listOf(
     ModeInfo("manual", "自分で出る", "AIは出ません。出るまで鳴らします", Icons.Rounded.PhoneInTalk),
 )
 
+/** 履歴を一度に読む件数。下端に近づいたら次の分を読む */
+private const val PAGE = 30
+
 @Composable
 fun HomeScreen(
     prefs: Prefs,
     paused: Boolean,
     onResume: () -> Unit,
     onOpenCall: (String) -> Unit,
-    onOpenHistory: () -> Unit,
     onOpenSettings: () -> Unit,
     onDial: () -> Unit,
 ) {
-    val api = FragmentApi(prefs)
-    val calls by rememberPolled(Unit, 2500) { api.calls(12) }
+    val api = remember(prefs) { FragmentApi(prefs) }
+    // 新しい方は数秒おきに取り直す (通話中・終わったばかりの通話を映す)。古い方は下へ送るたびに足す。
+    // ⚠2026-09-26 に履歴タブをやめてホームに一本化した (ユーザー「無限に下にスクロールできればいい」)
+    val head by rememberPolled(Unit, 2500) { api.calls(PAGE) }
+    val older = remember { mutableStateListOf<FragmentApi.Call>() }
+    var reachedEnd by remember { mutableStateOf(false) }
+    var loadingMore by remember { mutableStateOf(false) }
     val mode by ServerState.answerMode.collectAsState()
     val activeState by ServerState.activeCall.collectAsState()
+    val expanded = remember { mutableStateListOf<String>() }
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
 
-    val list = calls.orEmpty()
-    val activeCall = list.firstOrNull { it.active }
-    val recent = list.filter { !it.active }.take(5)
+    val headList = head.orEmpty()
+    val headIds = headList.map { it.id }.toSet()
+    val all = headList + older.filter { it.id !in headIds }
+    val activeCall = all.firstOrNull { it.active }
+    val past = all.filter { !it.active }
+    val days = past.groupBy { localDate(it.startedAt) }.toList()
+
+    // 下端の少し手前で次の分を読む。⚠読んでいる間は重ねて読まない
+    LaunchedEffect(listState, head != null) {
+        if (head == null) return@LaunchedEffect
+        snapshotFlow {
+            val info = listState.layoutInfo
+            (info.visibleItemsInfo.lastOrNull()?.index ?: 0) >= info.totalItemsCount - 6
+        }.collect { near ->
+            if (!near || reachedEnd || loadingMore) return@collect
+            val oldest = (older.lastOrNull() ?: head?.lastOrNull()) ?: return@collect
+            loadingMore = true
+            val more = withContext(Dispatchers.IO) { api.calls(PAGE, before = oldest.startedAt) }
+            if (more != null) {
+                older.addAll(more.filter { m -> older.none { it.id == m.id } })
+                if (more.size < PAGE) reachedEnd = true
+            }
+            loadingMore = false
+        }
+    }
 
     Box(Modifier.fillMaxSize()) {
-        LazyColumn(contentPadding = PaddingValues(bottom = 96.dp)) {
+        LazyColumn(state = listState, contentPadding = PaddingValues(bottom = 96.dp)) {
             item { PageTitle("フラグメント") }
             item {
                 // ⚠ここでは切り替えない (2026-09-19 ユーザー「設定にあるなら管制室で応答モードは
@@ -129,45 +169,80 @@ fun HomeScreen(
                     }
                 }
             }
-            item {
-                SectionLabel("最近の通話") {
-                    TextButton(onClick = onOpenHistory) { Text("すべて") }
+            if (head == null || past.isEmpty()) {
+                item {
+                    Text(
+                        if (head == null) "読み込み中…" else "まだ通話はありません",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(24.dp),
+                    )
                 }
             }
-            item {
-                Card(Modifier.padding(horizontal = 16.dp)) {
-                    if (calls == null) {
-                        Text(
-                            "読み込み中…",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(18.dp),
-                        )
-                    } else if (recent.isEmpty()) {
-                        Text(
-                            "まだ通話はありません",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(18.dp),
-                        )
+            // 日ごとの見出し + 1 行ずつ。⚠日ごとに 1 枚のカードにまとめると 1 項目が大きくなり、
+            //   逐次読み込みの意味が薄れるので、行ごとに項目にして角だけ丸める
+            days.forEach { (day, list) ->
+                item(key = "d:$day") { SectionLabel(formatDay(day)) }
+                list.forEachIndexed { i, c ->
+                    item(key = c.id) {
+                        val top = if (i == 0) 20.dp else 0.dp
+                        val bottom = if (i == list.lastIndex) 20.dp else 0.dp
+                        Surface(
+                            color = MaterialTheme.colorScheme.surfaceContainerLowest,
+                            shape = RoundedCornerShape(top, top, bottom, bottom),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp),
+                        ) {
+                            Column {
+                                if (i > 0) RowDivider()
+                                CallRow(
+                                    c,
+                                    expanded = c.id in expanded,
+                                    onToggle = { if (c.id in expanded) expanded.remove(c.id) else expanded.add(c.id) },
+                                    onOpen = { onOpenCall(c.id) },
+                                )
+                            }
+                        }
                     }
-                    recent.forEachIndexed { i, c ->
-                        if (i > 0) RowDivider()
-                        CallRow(c) { onOpenCall(c.id) }
-                    }
+                }
+            }
+            if (loadingMore) {
+                item {
+                    Text(
+                        "読み込み中…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(24.dp),
+                    )
                 }
             }
         }
-        ExtendedFloatingActionButton(
-            onClick = onDial,
-            icon = { Icon(Icons.Rounded.Dialpad, contentDescription = null) },
-            text = { Text("発信") },
-            containerColor = MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary,
-            modifier = Modifier
+        Column(
+            Modifier
                 .align(Alignment.BottomEnd)
                 .padding(20.dp),
-        )
+            horizontalAlignment = Alignment.End,
+        ) {
+            // 一番上へ。⚠スクロールの動きは付けない (作業用の画面は即時に)
+            if (listState.firstVisibleItemIndex > 4) {
+                SmallFloatingActionButton(
+                    onClick = { scope.launch { listState.scrollToItem(0) } },
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    contentColor = MaterialTheme.colorScheme.onSurface,
+                ) {
+                    Icon(Icons.Rounded.ArrowUpward, contentDescription = "一番上へ")
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+            ExtendedFloatingActionButton(
+                onClick = onDial,
+                icon = { Icon(Icons.Rounded.Dialpad, contentDescription = null) },
+                text = { Text("発信") },
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+            )
+        }
     }
 }
 
@@ -283,6 +358,9 @@ private fun ActiveCallCard(call: FragmentApi.Call, onOpenCall: (String) -> Unit,
     val sem = LocalSemantic.current
     val audio by CallAudio.state.collectAsState()
     val mine = audio.room == call.room && audio.operator
+    // 担い手 (2026-09-26): 「AIが応対中」「〇〇が応対中」「保留中」
+    val live by ServerState.activeCall.collectAsState()
+    val state = live?.takeIf { it.id == call.id }
     Card(modifier, onClick = { onOpenCall(call.id) }) {
         Column(Modifier.padding(18.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -290,7 +368,7 @@ private fun ActiveCallCard(call: FragmentApi.Call, onOpenCall: (String) -> Unit,
                 Spacer(Modifier.width(8.dp))
                 Elapsed(call.startedAt, color = sem.live)
                 Spacer(Modifier.weight(1f))
-                HandlerPill(mine)
+                HandlerPill(mine, if (mine) null else state?.handlerLabel, hold = state?.handler == "hold")
             }
             Spacer(Modifier.height(14.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -349,7 +427,7 @@ private fun ActiveCallCard(call: FragmentApi.Call, onOpenCall: (String) -> Unit,
                     ) {
                         Icon(Icons.Rounded.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text("自分が出る")
+                        Text("話す")
                     }
                 }
             }
@@ -359,22 +437,30 @@ private fun ActiveCallCard(call: FragmentApi.Call, onOpenCall: (String) -> Unit,
 
 /** いま誰が話しているか (AI / あなた) の札 */
 @Composable
-fun HandlerPill(mine: Boolean) {
+fun HandlerPill(mine: Boolean, label: String? = null, hold: Boolean = false) {
     val sem = LocalSemantic.current
     Surface(
         shape = RoundedCornerShape(50),
-        color = if (mine) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+        color = when {
+            mine -> MaterialTheme.colorScheme.primaryContainer
+            hold -> MaterialTheme.colorScheme.tertiaryContainer
+            else -> MaterialTheme.colorScheme.surfaceContainerHigh
+        },
     ) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(
-                if (mine) Icons.Rounded.Mic else Icons.Rounded.SmartToy,
+                when {
+                    mine -> Icons.Rounded.Mic
+                    hold -> Icons.Rounded.Pause
+                    else -> Icons.Rounded.SmartToy
+                },
                 contentDescription = null,
                 modifier = Modifier.size(14.dp),
                 tint = if (mine) sem.me else MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.width(5.dp))
             Text(
-                if (mine) "あなたが応対中" else "AIが応対中",
+                label ?: if (mine) "あなたが応対中" else "AIが応対中",
                 style = MaterialTheme.typography.labelMedium,
                 color = if (mine) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -397,31 +483,3 @@ fun speakerColor(s: String) = when (s) {
     else -> MaterialTheme.colorScheme.onSurfaceVariant
 }
 
-@Composable
-fun HistoryScreen(prefs: Prefs, onOpenCall: (String) -> Unit) {
-    val api = FragmentApi(prefs)
-    val calls by rememberPolled(Unit, 5000) { api.calls(100) }
-    val groups = calls.orEmpty().groupBy { localDate(it.startedAt) }.toList()
-
-    LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(bottom = 24.dp)) {
-        item { PageTitle("履歴") }
-        if (calls == null) {
-            item {
-                Text(
-                    "読み込み中…",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(24.dp),
-                )
-            }
-        }
-        items(groups, key = { it.first.toString() }) { (day, list) ->
-            SectionLabel(formatDay(day))
-            Card(Modifier.padding(horizontal = 16.dp)) {
-                list.forEachIndexed { i, c ->
-                    if (i > 0) RowDivider()
-                    CallRow(c, clock = true) { onOpenCall(c.id) }
-                }
-            }
-        }
-    }
-}

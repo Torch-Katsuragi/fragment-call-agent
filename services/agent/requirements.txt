@@ -15,3 +15,7 @@ asyncpg~=0.30
 # FCM (端末を起こすプッシュ、hookd の push.py)。google-genai 経由で入ってはいるが、
 # 明示しておく — 依存の巻き添えで消えるとプッシュが黙って止まる
 google-auth~=2.38
+# 祝日 (応答モードの時間割、schedule.py。2026-09-29)。無ければ祝日なし扱いで動く
+jpholiday~=1.0
+# 軽い VAD (LIVE_VAD=webrtc、2026-10-02 試験中)。webrtcvad 本家は wheel が無いのでビルド済みのこちら
+webrtcvad-wheels~=2.0

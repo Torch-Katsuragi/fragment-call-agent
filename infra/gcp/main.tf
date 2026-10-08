@@ -31,7 +31,11 @@ resource "google_compute_instance" "call_agent" {
   boot_disk {
     initialize_params {
       image = "debian-cloud/debian-12"
-      size  = 50
+      # ⚠2026-10-02 に 50→20GB へ縮めた (費用。使用 12GB)。縮小は作業用 VM でファイルシステムを縮めて
+      #   新しいディスク call-agent-20g に写し、起動ディスクを差し替えた (GCP はその場で縮められない)。
+      #   ⚠実物のディスク名は call-agent-20g で、ここから作った call-agent ではない = terraform の状態とずれている。
+      #   apply すると VM を作り直そうとするので、触る前に state を合わせること
+      size = 20
     }
   }
 

@@ -154,7 +154,9 @@ private fun IncomingCallScreen(
             //   着信は「まだ誰も出ていない — 出なければAIが預かる」。
             //   出た後の挙動も違うので、見分けが付かないと押し間違える
             Text(
-                text = if (incoming.kind == CallCoordinator.Kind.HANDOFF) {
+                text = if (incoming.manual) {
+                    "${incoming.by.ifEmpty { "ほかの端末" }}から保留中の通話です"
+                } else if (incoming.kind == CallCoordinator.Kind.HANDOFF) {
                     "フラグメントが呼んでいます"
                 } else {
                     "着信 · 出なければAIが預かります"
@@ -251,7 +253,11 @@ private fun IncomingCallScreen(
                     CallButton("切る", Icons.Filled.CallEnd, Color(0xFFE24B4A), onReject)
                 }
                 CallButton(
-                    if (incoming.kind == CallCoordinator.Kind.CALL) "AIに任せる" else "AIに続けさせる",
+                    when {
+                        incoming.kind == CallCoordinator.Kind.CALL -> "AIに任せる"
+                        incoming.manual -> "出られない"
+                        else -> "AIに続けさせる"
+                    },
                     Icons.Filled.SmartToy,
                     Color(0xFF5B6B7A),
                     onToAi,

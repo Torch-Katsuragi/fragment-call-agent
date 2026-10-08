@@ -1,5 +1,7 @@
 package jp.sleeptree.fragment.ui
 
+import android.app.KeyguardManager
+import android.content.Intent
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -71,6 +73,9 @@ import kotlin.math.sin
  *   音を流すかは「通話画面の外でも音を流す」設定に従う。波形は音を受けなくても動く
  *   (サーバーの話者レベルで動かす — CallAudio の注記)。
  * ⚠フラグメント (【本人限定】を含みうる) はロック画面に出さない。会話だけ
+ * ⚠2026-09-26 から担い手に合わせて見出しを変える (「AIが応対中」「〇〇が応対中」「保留中」)。
+ *   「話す」で会話に入れる — ロック中はまず解除を求め、解除できたら通話画面を開いて入る
+ *   (押しただけで相手と声がつながらないように)
  */
 class LiveCallActivity : ComponentActivity() {
 
@@ -95,9 +100,24 @@ class LiveCallActivity : ComponentActivity() {
                 LaunchedEffect(active) {
                     if (active != callId) finish()
                 }
-                LiveScreen(prefs, callId, mode, onClose = { finish() })
+                LiveScreen(prefs, callId, mode, onClose = { finish() }, onTalk = ::talk)
             }
         }
+    }
+
+    private fun talk(room: String) {
+        val open = {
+            startActivity(MainActivity.callIntent(this, room).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            finish()
+        }
+        val km = getSystemService(KeyguardManager::class.java)
+        if (km == null || !km.isKeyguardLocked) {
+            open()
+            return
+        }
+        km.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+            override fun onDismissSucceeded() = open()
+        })
     }
 
     companion object {
@@ -111,7 +131,7 @@ private val AiGreen = Color(0xFF5CCBA3)
 private val CallerAmber = Color(0xFFF0B25E)
 
 @Composable
-private fun LiveScreen(prefs: Prefs, callId: String, mode: String, onClose: () -> Unit) {
+private fun LiveScreen(prefs: Prefs, callId: String, mode: String, onClose: () -> Unit, onTalk: (String) -> Unit) {
     val ctx = LocalContext.current
     val api = remember(prefs) { FragmentApi(prefs) }
     var call by remember { mutableStateOf<FragmentApi.Call?>(null) }
@@ -150,8 +170,21 @@ private fun LiveScreen(prefs: Prefs, callId: String, mode: String, onClose: () -
         ) {
             LiveDot()
             Spacer(Modifier.size(8.dp))
-            Text("AIが応対中  ", style = MaterialTheme.typography.labelLarge, color = Color.White.copy(alpha = 0.8f))
+            val state by ServerState.activeCall.collectAsState()
+            val label = state?.takeIf { it.id == callId }?.handlerLabel ?: "AIが応対中"
+            Text("$label  ", style = MaterialTheme.typography.labelLarge, color = Color.White.copy(alpha = 0.8f))
             if (c != null) Elapsed(c.startedAt, color = Color.White.copy(alpha = 0.6f))
+        }
+        if (c != null) {
+            androidx.compose.material3.Button(
+                onClick = { onTalk(c.room) },
+                colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = AiGreen, contentColor = Ink),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 32.dp),
+            ) {
+                Text("話す", style = MaterialTheme.typography.titleMedium)
+            }
         }
     }
 }

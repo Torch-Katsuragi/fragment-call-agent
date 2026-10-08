@@ -565,6 +565,19 @@ h1 {
   margin: 12px 0;
 }
 
+/* 通話詳細の録音 (2026-10-02) */
+.call-recording {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+  margin: 0 0 12px;
+}
+.call-recording audio {
+  height: 36px;
+  width: min(420px, 100%);
+}
+
 /* グローバル通話チップ: 通話画面以外にいる時、通話中であることを示し音声も流れている */
 .global-call-chip {
   position: fixed;
@@ -1280,26 +1293,6 @@ button:disabled {
 .slider-ctl input[type="range"] {
   width: 140px;
 }
-.pair-ctl {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-.pair-ctl input {
-  width: 130px;
-  padding: 7px 10px;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-.pair-qr {
-  display: block;
-  background: #fff;
-  border-radius: 8px;
-  margin: 4px 0 8px;
-}
-
 /* オン/オフのスイッチ (components/Toggle.tsx)。⚠アニメーションは付けない */
 .switch {
   position: relative;
@@ -1336,3 +1329,36 @@ button:disabled {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
+/* メンバーと招待 (2026-09-26) */
+.member-ops { display: flex; gap: 8px; align-items: center; }
+.member-ops select, .member-invite select, .member-invite input {
+  background: #1b202a; color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 10px; font-size: 13px;
+}
+.member-invite { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.member-invite input { flex: 1; min-width: 200px; }
+.member-link { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.member-link code { overflow-wrap: anywhere; font-size: 12px; }
+.btn-quiet.danger { color: #f87171; }
+.invite { max-width: 520px; margin: 48px auto; padding: 0 16px; display: flex; flex-direction: column; gap: 12px; }
+.invite-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.btn-primary {
+  background: var(--ai); color: #0b0f0d; border: none; border-radius: 8px;
+  padding: 9px 16px; font-size: 14px; text-decoration: none; cursor: pointer;
+}
+
+/* 時間割と受付時間 (2026-09-29) */
+.week { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.week-row { display: flex; gap: 12px; align-items: flex-start; }
+.week-row.off .week-day { color: #f87171; }
+.week-day { width: 1.5em; padding-top: 6px; font-weight: 600; flex: none; }
+.week-blocks { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+.week-block { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.week-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.week-block input, .week-block select, .set-select, .set-textarea {
+  background: #1b202a; color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 5px 8px; font-size: 13px;
+}
+.week-block input[type="time"] { color-scheme: dark; }
+.set-textarea { width: 100%; margin-top: 6px; font-family: inherit; resize: vertical; }

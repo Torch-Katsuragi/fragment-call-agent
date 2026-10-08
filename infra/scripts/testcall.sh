@@ -20,6 +20,7 @@ scenario="${1:-}"
 q=$(python -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$scenario")
 
 # hookd は VM の 127.0.0.1 でしか待ち受けていない (外に出す口は塞いである) ので ssh 越しに叩く
+# ⚠相手役AIは普段止めてある (2026-10-02、メモリ節約)。止まっていれば起こし、10 分後に止める
 gcloud compute ssh "$VM" --project "$PROJECT" --zone "$ZONE" \
-  --command "curl -s 'http://127.0.0.1:8790/simulate_call?scenario=$q'"
+  --command "if [ -z \"\$(sudo docker ps -q -f name=infra-caller-sim-1)\" ]; then sudo docker start infra-caller-sim-1 >/dev/null && sleep 8; nohup sh -c 'sleep 600; sudo docker stop infra-caller-sim-1' >/dev/null 2>&1 & fi; curl -s 'http://127.0.0.1:8790/simulate_call?scenario=$q'"
 echo

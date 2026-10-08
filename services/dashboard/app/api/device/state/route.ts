@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { pool } from "@/lib/db";
 import { phonebookName } from "@/lib/phonebook";
 import { numberLookup, type NumberLookup } from "@/lib/numberLookup";
-import { deriveAnswerMode } from "@/lib/answerMode";
+import { modeInfo, type ModeInfo } from "@/lib/answerMode";
+import { deviceFrom } from "@/lib/device";
 
 export const dynamic = "force-dynamic";
 // ロングポーリングで最大25秒ぶら下がる。⚠既定 (Vercel等の短いタイムアウト) では切られるので
@@ -25,9 +26,11 @@ export async function GET(req: NextRequest) {
   const waitSec = Math.min(Number(req.nextUrl.searchParams.get("wait") ?? 0) || 0, 25);
   const since = req.nextUrl.searchParams.get("v") ?? "";
   const deadline = Date.now() + waitSec * 1000;
+  // 端末の名前と役割を控える (保留中に呼ぶ相手の候補になる)
+  const dev = deviceFrom(req);
 
   for (;;) {
-    const snap = await snapshot();
+    const snap = await snapshot(dev?.id ?? "");
     if (snap.v !== since || Date.now() >= deadline) {
       return NextResponse.json(snap);
     }
@@ -36,7 +39,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-async function snapshot() {
+async function snapshot(deviceId: string) {
   // --- ①取り次ぎ (hookd の in-memory 状態) ---
   let handoff: {
     room: string;
@@ -47,9 +50,15 @@ async function snapshot() {
     fragments: { kind: string; title: string; text: string }[];
     recent: { speaker: string; text: string }[];
     lookup: NumberLookup | null;
+    // ai = AI の取り次ぎ / manual = 保留中に人が呼んだ (by = 呼んだ端末の名前)
+    kind: string;
+    by: string;
   } | null = null;
   try {
-    const res = await fetch(`${HOOKD}/handoff_state`, { cache: "no-store" });
+    // ⚠端末を名乗る。宛先を指定した呼び出しは宛先の端末にだけ返る (hookd)
+    const res = await fetch(`${HOOKD}/handoff_state?device=${encodeURIComponent(deviceId)}`, {
+      cache: "no-store",
+    });
     if (res.ok) {
       const h = (await res.json()).handoff;
       if (h) {
@@ -92,6 +101,8 @@ async function snapshot() {
           recent,
           // 電話帳に無い相手だけ。web検索の名前で「番号検索中…」を置き換える
           lookup: name ? null : await numberLookup(h.number ?? null),
+          kind: h.kind ?? "ai",
+          by: h.by ?? "",
         };
       }
     }
@@ -113,7 +124,10 @@ async function snapshot() {
     lookup: NumberLookup | null;
   } | null = null;
   try {
-    const res = await fetch(`${HOOKD}/ringing_state`, { cache: "no-store" });
+    // ⚠端末を名乗る。受付時間外の人の端末には着信が返らない (hookd、2026-09-29)
+    const res = await fetch(`${HOOKD}/ringing_state?device=${encodeURIComponent(deviceId)}`, {
+      cache: "no-store",
+    });
     if (res.ok) {
       const r = (await res.json()).ringing;
       if (r && !r.pickup && (r.ring_ms ?? 0) > 0) {
@@ -136,20 +150,37 @@ async function snapshot() {
 
   // --- ③通話中 (ロック画面の「通話中」カード用) ---
   // id も返す — アプリが応答後に /call/<id>?op=1 を開くのに要る (room からは引けない)
-  let activeCall: { id: string; room: string; number: string; name: string | null } | null = null;
+  // 担い手と参加者 (2026-09-26): handler = ai / human / hold / connecting (agent が書く)。
+  // presence = ルームにいる端末 [{id, name, role: talk|watch}]。待機中の端末はこれで
+  // 「誰が話しているか・保留中か」を見せ、視聴・会話へ入る入口を出す
+  let activeCall: {
+    id: string;
+    room: string;
+    number: string;
+    name: string | null;
+    handler: string;
+    ai_on: boolean;
+    hold_since: string | null;
+    presence: { id: string; name: string; role: string }[];
+  } | null = null;
   try {
     const r = await pool.query(
-      `SELECT id, room_name, caller_number FROM calls
+      `SELECT id, room_name, caller_number, handler, ai_on, hold_since, presence FROM calls
        WHERE ended_at IS NULL
        ORDER BY started_at DESC LIMIT 1`,
     );
     if (r.rows.length > 0) {
-      const number = r.rows[0].caller_number ?? "";
+      const row = r.rows[0];
+      const number = row.caller_number ?? "";
       activeCall = {
-        id: String(r.rows[0].id),
-        room: r.rows[0].room_name,
+        id: String(row.id),
+        room: row.room_name,
         number,
         name: phonebookName(number || null),
+        handler: row.handler ?? "ai",
+        ai_on: row.ai_on ?? true,
+        hold_since: row.hold_since ? new Date(row.hold_since).toISOString() : null,
+        presence: Array.isArray(row.presence) ? row.presence : [],
       };
     }
   } catch {
@@ -196,15 +227,25 @@ async function snapshot() {
   }
 
   // --- ④応答モード ---
-  let answerMode = "away";
+  // ⚠いまのモードは hookd に聞く (時間割・手動の上書き、2026-09-29)
+  let info: ModeInfo = {
+    mode: "away",
+    source: "fixed",
+    schedule_enabled: false,
+    next_at: null,
+    next_mode: null,
+  };
   try {
-    const r = await pool.query(
-      "SELECT key, value FROM settings WHERE key IN ('answer_mode', 'assistant_enabled')",
-    );
-    answerMode = deriveAnswerMode(new Map(r.rows.map((x) => [x.key, x.value])));
+    info = await modeInfo(async () => {
+      const r = await pool.query(
+        "SELECT key, value FROM settings WHERE key IN ('answer_mode', 'assistant_enabled')",
+      );
+      return new Map(r.rows.map((x) => [x.key, x.value]));
+    });
   } catch {
     // DB不調時はAI応答 (fail-open) と揃える
   }
+  const answerMode = info.mode;
 
   // ロングポーリングの変化検知に使う指紋。⚠**時間で変わる値を入れないこと** —
   //   ring_ms や expires_in を混ぜると毎回変わってロングポーリングが成立しない
@@ -217,8 +258,14 @@ async function snapshot() {
     // 検索が終わったら返す (着信画面の「番号検索中…」を置き換えるため)
     `${incoming?.lookup?.status ?? "-"}/${handoff?.lookup?.status ?? "-"}`,
     activeCall?.id ?? "-",
+    // 担い手・参加者が変わったら返す (待機中の表示を「〇〇が応対中」「保留中」に切り替える)
+    activeCall
+      ? `${activeCall.handler}:${activeCall.ai_on}:` +
+        activeCall.presence.map((p) => `${p.id}.${p.role}`).sort().join(",")
+      : "-",
     recentEnded.map((e) => e.id).join(",") || "-",
-    answerMode,
+    // 次の切り替わりが変わったら返す (常駐通知の「17:00 に不在へ」を更新する)
+    `${answerMode}:${info.source}:${info.next_at ?? "-"}`,
   ].join("|");
 
   return {
@@ -228,5 +275,6 @@ async function snapshot() {
     active_call: activeCall,
     recent_ended: recentEnded,
     answer_mode: answerMode,
+    mode_info: info,
   };
 }

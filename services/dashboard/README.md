@@ -28,7 +28,7 @@ npm run build && npm start   # 本番
 | 着信バナー (切る / AI に任せる / 出る) | `/api/ringing`、`/api/pickup`、`/api/device/decide` |
 | 通話画面 (文字起こし・吹き出し・耳打ち・交代・終話) | `/api/calls/[id]`、`/api/calls/[id]/whisper`、`/api/calls/[id]/hangup`、`/api/token` |
 | 発信 | `/api/dial` |
-| 設定 (応答モード・声・回線・端末) | `/api/settings`、`/api/device/pair` |
+| 設定 (応答モード・声・回線・端末) | `/api/settings`、`/api/members` |
 | 警備 | `/api/security` |
 | スマホアプリ | `/api/device/state` (ロングポーリング)、`/api/device/config`、`/api/device/push` ほか |
 

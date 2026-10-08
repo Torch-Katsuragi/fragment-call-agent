@@ -169,13 +169,13 @@ def case_manual() -> None:
 def case_standby_all_paused() -> None:
     """登録端末が全部一時停止ならスタンバイでも待たずに返す (2026-09-24)"""
     print("[スタンバイ] 端末が全部一時停止 → 待たずにAIへ")
-    total = psql("SELECT count(*) FROM device_push_tokens").strip()
+    total = psql("SELECT count(*) FROM device_sessions WHERE push_token IS NOT NULL AND revoked_at IS NULL").strip()
     if total in ("", "0"):
         print("  (端末の登録が無いので省略)")
         return
-    before = psql("SELECT string_agg(token, ',') FROM device_push_tokens WHERE NOT paused").strip()
+    before = psql("SELECT string_agg(token_hash, ',') FROM device_sessions WHERE NOT paused AND revoked_at IS NULL").strip()
     try:
-        psql("UPDATE device_push_tokens SET paused = true")
+        psql("UPDATE device_sessions SET paused = true")
         set_mode("standby")
         start_ring()
         t0 = time.time()
@@ -186,7 +186,7 @@ def case_standby_all_paused() -> None:
     finally:
         # 元に戻す。⚠一時停止していた端末まで起こさない (元々 NOT paused だったものだけ戻す)
         for tok in [t for t in before.split(",") if t]:
-            psql("UPDATE device_push_tokens SET paused = false WHERE token = '%s'" % tok)
+            psql("UPDATE device_sessions SET paused = false WHERE token_hash = '%s'" % tok)
 
 
 def case_unknown_number() -> None:
@@ -202,10 +202,10 @@ def main() -> int:
     #   待たずに返る (それが仕様) ので、「8秒で返る」等の前提が崩れて FAIL する。
     #   端末側の Prefs.paused には触らないので、テスト中も一時停止中の端末は鳴らない
     paused_before = [
-        t for t in psql("SELECT string_agg(token, ',') FROM device_push_tokens WHERE paused").strip().split(",") if t
+        t for t in psql("SELECT string_agg(token_hash, ',') FROM device_sessions WHERE paused AND revoked_at IS NULL").strip().split(",") if t
     ]
     if paused_before:
-        psql("UPDATE device_push_tokens SET paused = false")
+        psql("UPDATE device_sessions SET paused = false")
         print(f"(一時停止中の端末 {len(paused_before)} 台をテスト中だけサーバー側で解除)")
         print()
     try:
@@ -226,7 +226,7 @@ def main() -> int:
             psql("DELETE FROM settings WHERE key = 'answer_mode'")
         print(f"応答モードを元に戻した: {before or '(未設定)'}")
         for tok in paused_before:
-            psql("UPDATE device_push_tokens SET paused = true WHERE token = '%s'" % tok)
+            psql("UPDATE device_sessions SET paused = true WHERE token_hash = '%s'" % tok)
         if paused_before:
             print(f"一時停止を元に戻した: {len(paused_before)} 台")
 

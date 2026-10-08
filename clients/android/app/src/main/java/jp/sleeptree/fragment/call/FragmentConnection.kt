@@ -45,6 +45,20 @@ class FragmentConnection(private val context: Context) : Connection() {
         if (state == STATE_ACTIVE) CallCoordinator.hangup(context) else CallCoordinator.toAi(context)
     }
 
+    /**
+     * OS からの保留 (2026-09-26)。申告しているのに実装が無く、何も起きていなかった。
+     * 保留 = 会話から抜ける (AI 応答はオフのままなので、他に会話中の端末が無ければ相手には保留音)
+     */
+    override fun onHold() {
+        Log.i(TAG, "onHold (from OS)")
+        CallCoordinator.onOsHold(context, true)
+    }
+
+    override fun onUnhold() {
+        Log.i(TAG, "onUnhold (from OS)")
+        CallCoordinator.onOsHold(context, false)
+    }
+
     /** OSが「他の通話に譲れ」と言ってきた。素直に降りる */
     override fun onCallAudioStateChanged(state: android.telecom.CallAudioState?) {
         Log.d(TAG, "audio state: $state")

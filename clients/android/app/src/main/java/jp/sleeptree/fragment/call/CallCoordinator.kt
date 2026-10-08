@@ -57,6 +57,12 @@ object CallCoordinator {
          *   answer() で弾く
          */
         val announcing: Boolean = false,
+        /**
+         * 保留中に人が呼んだ (2026-09-26)。by = 呼んだ端末の名前。AI の取り次ぎと違い、断っても
+         * AI は何もしない (保留が続き、長引けば AI が引き取る)
+         */
+        val manual: Boolean = false,
+        val by: String = "",
     )
 
     private val _incoming = MutableStateFlow<Incoming?>(null)
@@ -86,7 +92,10 @@ object CallCoordinator {
     fun onHandoffRequested(context: Context, h: FragmentApi.Handoff) {
         ring(
             context,
-            Incoming(h.room, h.number, h.name, h.reason, h.fragments, h.recent, Kind.HANDOFF, h.lookup),
+            Incoming(
+                h.room, h.number, h.name, h.reason, h.fragments, h.recent, Kind.HANDOFF, h.lookup,
+                manual = h.manual, by = h.by,
+            ),
         )
     }
 
@@ -243,6 +252,29 @@ object CallCoordinator {
         endConnection(DisconnectCause.LOCAL)
         answeredByUser = false
         jp.sleeptree.fragment.audio.CallAudio.endAll()
+    }
+
+    /**
+     * 会話に入る / 抜ける (2026-09-26、services/agent/presence.py)。抜けた後は、通話画面を開いていれば
+     * 視聴、閉じていれば待機。AI 応答がオフのまま全員が抜ければ保留になる。
+     * OS の通話 (Connection) があれば保留状態を揃える — Bluetooth・車載機の表示と、他の通話との調停のため
+     */
+    fun setTalking(context: Context, room: String, on: Boolean) {
+        jp.sleeptree.fragment.audio.CallAudio.setOperator(context, room, on)
+        connection?.let { c ->
+            try {
+                if (on) c.setActive() else c.setOnHold()
+            } catch (e: Exception) {
+                Log.w(TAG, "connection hold state failed", e)
+            }
+        }
+    }
+
+    /** OS からの保留・保留解除 (Bluetooth のボタン、割り込んできた別の通話など) */
+    fun onOsHold(context: Context, hold: Boolean) {
+        val room = ServerState.activeCall.value?.room ?: return
+        Log.i(TAG, "OS hold=$hold room=$room")
+        setTalking(context, room, !hold)
     }
 
     /**

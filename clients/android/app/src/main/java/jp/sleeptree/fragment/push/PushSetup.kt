@@ -78,9 +78,12 @@ object PushSetup {
     /** トークンを管制室に登録する (同じものは送らない)。onNewToken からも呼ぶ */
     fun register(prefs: Prefs, api: FragmentApi, token: String): Boolean {
         if (token.isEmpty()) return false
-        if (token == prefs.pushRegisteredToken) return true
+        // ⚠端末 id (2026-09-26) を付ける前に登録した分は、一度だけ送り直す。
+        //   付いていないと、保留中に宛先を指定して呼んでも、この端末を push で起こせない
+        if (token == prefs.pushRegisteredToken && prefs.pushHasDeviceId) return true
         if (!api.registerPush(token)) return false
         prefs.pushRegisteredToken = token
+        prefs.pushHasDeviceId = true
         Log.i(TAG, "push token registered")
         return true
     }

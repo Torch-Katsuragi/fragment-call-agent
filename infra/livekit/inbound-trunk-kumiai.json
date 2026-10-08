@@ -1,0 +1,7 @@
+{
+  "trunk": {
+    "name": "asterisk-bridge-kumiai",
+    "numbers": ["kumiai"],
+    "allowed_addresses": ["127.0.0.1/32"]
+  }
+}

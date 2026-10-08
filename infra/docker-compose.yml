@@ -102,6 +102,10 @@ services:
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
       ELEVEN_API_KEY: ${ELEVEN_API_KEY}
       AI_CORE: ${AI_CORE:-live}
+      # live の VAD (2026-10-02、試験中): silero (既定) / webrtc (軽い、services/agent/webrtc_vad.py)
+      LIVE_VAD: ${LIVE_VAD:-silero}
+      # 先に立ち上げておく通話プロセスの数 (空 = ライブラリの既定 = CPU 数)。VM を 2GB にするなら 1
+      NUM_IDLE_PROCESSES: ${NUM_IDLE_PROCESSES:-}
       GEMINI_VOICE: ${GEMINI_VOICE:-Leda}
       # モデル指定と定型文の経路 (2026-09-18)。⚠.envに書いてもここに列挙しないと届かない
       #   (この日も踏んだ: FIXED_LINES_VIA_MODEL=1 を .env に足しただけでコンテナでは空だった)
@@ -148,11 +152,18 @@ services:
       SECURITY_RATE_MAX: ${SECURITY_RATE_MAX:-5}
       SECURITY_RATE_WINDOW_SEC: ${SECURITY_RATE_WINDOW_SEC:-600}
       SECURITY_BLOCK_SEC: ${SECURITY_BLOCK_SEC:-3600}
+      # テナント (管制室) の台帳 (2026-10-04)。agent は全テナントで共有し、通話ごとに部屋名の頭で
+      # テナントを決めてその DB・作業フォルダ・hookd に切り替える (services/agent/tenants.py)
+      TENANTS_FILE: /tenant-registry/tenants.json
     volumes:
       - ../data:/data
       - ./secrets:/secrets:ro
       # 応対プロンプトのmdを読むため (読み取り専用。書くのは管制室=ホスト側)
       - ${FRAGMENT_WORKSPACE_HOST:-/srv/fragment/workspace}:/fragment:ro
+      # ⚠台帳はディレクトリごとマウントする (単一ファイルだと差し替えに追従しない)
+      - ./tenants:/tenant-registry:ro
+      # main 以外のテナントの作業フォルダ (/tenants/<id>/workspace)
+      - ${TENANTS_HOST:-/home/fragment/tenants}:/tenants:ro
     depends_on:
       - livekit
       - postgres
@@ -194,10 +205,16 @@ services:
     logging: *default-logging
     restart: unless-stopped
     command: python hookd.py
-    environment:
+    environment: &hookd-env
+      FRAGMENT_WORKSPACE: /fragment
       DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent
       # スタンバイで端末を鳴らす秒数。⚠asterisk 側 (ダイヤルプランの ENV) と同じ値を渡す (2026-09-18)
       STANDBY_RING_SEC: ${STANDBY_RING_SEC:-2}
+      # 電話帳で「人が出る」にした相手を鳴らす秒数 (2026-09-30)。⚠asterisk と hookd で揃える
+      PRIORITY_RING_SEC: ${PRIORITY_RING_SEC:-20}
+      # 保留中に呼ぶ相手の候補を会話から並べ替える (presence.py、2026-09-26)。無ければ並べ替えずに返す
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      RANK_MODEL: ${RANK_MODEL:-gemini-3.8-flash}
       # テスト通話シミュレータがルーム作成+caller-simディスパッチに使う
       LIVEKIT_URL: ws://livekit:7880
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
@@ -225,21 +242,48 @@ services:
       # 検知の通知先 (Discord/SlackのWebhook URL)。未設定なら管制室UIにだけ出る
       SECURITY_WEBHOOK_URL: ${SECURITY_WEBHOOK_URL:-}
       DASHBOARD_URL: ${DASHBOARD_URL:-}
-      # 録音の掃除。⚠**0 = 掃除しない (既定)**。日数を入れたときだけ動く。
-      # 録音は取り返しがつかないので、何日で消すかは運用の判断に委ねてある
-      RECORDING_RETENTION_DAYS: ${RECORDING_RETENTION_DAYS:-0}
       # FCM で端末を起こす (2026-09-18)。サービスアカウント鍵のコンテナ内パス。
       # 未設定なら押さない (ロングポーリングのみ)。鍵は infra/secrets/ に置く
       FCM_SERVICE_ACCOUNT: ${FCM_SERVICE_ACCOUNT:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      # 録音の掃除係が消すために要る。⚠書き込む唯一の理由がこれ。
-      # 録音そのものを作るのは asterisk 側 (MixMonitor)
-      - ../data/recordings:/recordings
       - ./secrets:/secrets:ro
+      # 電話帳の `応答:` (相手ごとの応答、2026-09-30) を読む。読み取り専用
+      - ${FRAGMENT_WORKSPACE_HOST:-/srv/fragment/workspace}:/fragment:ro
     ports:
       - "127.0.0.1:8790:8790"
+    depends_on:
+      - postgres
+
+  # ---- 2 つ目のテナントの管制室の hookd (2026-10-04、同居構成) ----
+  # hookd はテナントごとに 1 つ。設定は main の hookd を引き継ぎ、違うところだけ上書きする。
+  # 台帳は infra/tenants/tenants.json (ポート・部屋名の頭・DB・作業フォルダを揃えること)
+  hookd-kumiai:
+    build: ../services/agent
+    logging: *default-logging
+    restart: unless-stopped
+    command: python hookd.py
+    environment:
+      <<: *hookd-env
+      HOOKD_PORT: "8791"
+      ROOM_PREFIX: kumiai
+      FRAGMENT_WORKSPACE: /tenants/kumiai/workspace
+      DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent_kumiai
+      # テナントの回線 (Twilio、テナントの契約) からテナントの番号で出る
+      OUTBOUND_TRUNK: twilio-kumiai
+      OUTBOUND_CONTEXT: outbound-bridge-kumiai
+      OUTBOUND_CALLERID: ${KUMIAI_OUTBOUND_CALLERID:-}
+      SECURITY_LOCAL_NUMBERS: ${KUMIAI_SECURITY_LOCAL_NUMBERS:-}
+      SECURITY_ALLOW_NUMBERS: ${KUMIAI_SECURITY_ALLOW_NUMBERS:-}
+      SECURITY_WEBHOOK_URL: ${KUMIAI_SECURITY_WEBHOOK_URL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./secrets:/secrets:ro
+      - ${TENANTS_HOST:-/home/fragment/tenants}/kumiai/workspace:/tenants/kumiai/workspace:ro
+    ports:
+      - "127.0.0.1:8791:8791"
     depends_on:
       - postgres
 
@@ -252,17 +296,48 @@ services:
     profiles: ["vm-worker"]
     logging: *default-logging
     restart: unless-stopped
-    environment:
+    # ⚠ワークスペースを管制室 (ホストのユーザー) と同じ持ち主で書く (2026-09-26)。root で動かしていた頃は
+    #   worker の作った電話帳のフォルダに管制室が書けなかった (スマホの電話帳からの登録・緊急呼び出しの許可)
+    user: "${WORKSPACE_UID:-1000}:${WORKSPACE_GID:-1003}"
+    environment: &worker-env
       OWNER_NAME: ${OWNER_NAME:-}   # 本人の呼び名 (AI への指示文・相手役のセリフ)。氏名をソースに書かないため .env から
       DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
       # サーバーでは agy (Antigravity CLI) を使えないので Gemini 直呼び固定 (2026-07-17実測)
       DIRECTORY_AGENT_BACKEND: gemini
+      # ⚠時刻は JST で書く (2026-10-02)。worker は astimezone() でローカル時刻にするので、
+      #   これが無いとコンテナの UTC になり、通話記録 md の見出し・電話帳の追記・AI に渡す
+      #   過去の通話の時刻が 9 時間ずれていた。slim イメージに tzdata が無いので POSIX 形式で
+      TZ: JST-9
       FRAGMENT_WORKSPACE: /fragment
       # 判断層の取り次ぎ発火 (fire_handoff)。agentと同じ理由でサービス名直指定
       HOOKD_URL: http://hookd:8790
     volumes:
       - ${FRAGMENT_WORKSPACE_HOST:-/srv/fragment/workspace}:/fragment
+      # Asterisk の生の録音 (wav)。worker が Ogg にしてワークスペースの 録音/ へ移し、元は消す
+      # (2026-10-02、services/directory-agent/recordings.py)。保存期間は管制室の設定
+      - ../data/recordings:/recordings
+    depends_on:
+      - postgres
+
+  # ---- 2 つ目のテナントの管制室の後方支援 (2026-10-04、同居構成) ----
+  directory-agent-kumiai:
+    build: ../services/directory-agent
+    profiles: ["vm-worker"]
+    logging: *default-logging
+    restart: unless-stopped
+    user: "${WORKSPACE_UID:-1000}:${WORKSPACE_GID:-1003}"
+    environment:
+      <<: *worker-env
+      # ⚠ユーザーの氏名をテナントに持ち込まない。テナントの名乗りはテナントの管制室の設定 (self_label)
+      OWNER_NAME: ${KUMIAI_OWNER_NAME:-}
+      DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent_kumiai
+      FRAGMENT_WORKSPACE: /tenants/kumiai/workspace
+      HOOKD_URL: http://hookd-kumiai:8791
+    volumes:
+      - ${TENANTS_HOST:-/home/fragment/tenants}/kumiai/workspace:/tenants/kumiai/workspace
+      # テナントの通話の生の録音 (Asterisk が data/recordings/kumiai/ に書く)
+      - ../data/recordings/kumiai:/recordings
     depends_on:
       - postgres
 
@@ -281,6 +356,10 @@ services:
       OUTBOUND_CALLERID: ${OUTBOUND_CALLERID:-}  # 内線からの外線発信で名乗る番号
       # スタンバイで端末を鳴らす秒数 (2026-09-18に固定値2から環境変数へ)。⚠hookd にも同じ値を渡すこと
       STANDBY_RING_SEC: ${STANDBY_RING_SEC:-2}
+      # 電話帳で「人が出る」にした相手を鳴らす秒数 (2026-09-30)。⚠asterisk と hookd で揃える
+      PRIORITY_RING_SEC: ${PRIORITY_RING_SEC:-20}
+      # 2 つ目のテナントの番号 (Twilio から届く宛先、+81… の形)。この宛先の着信はテナントの管制室へ (2026-10-04)
+      KUMIAI_DID: ${KUMIAI_DID:-}
     volumes:
       - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
       - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
@@ -294,7 +373,8 @@ services:
       - ./asterisk/moh:/var/lib/asterisk/moh-fragment:ro
       # 通話録音の置き場 (MixMonitor の相対パスはここに解決される)。
       # 挨拶で「この通話は録音されます」と告知している実体がこれ (2026-07-30に実装。
-      # それまでは告知だけで音声を残していなかった)。8kHzモノラルwavで約1MB/分
+      # それまでは告知だけで音声を残していなかった)。8kHzモノラルwavで約1MB/分。
+      # ⚠ここは一時置き場 (2026-10-02〜)。通話が終わると worker が Ogg にしてワークスペースへ移す
       - ../data/recordings:/var/spool/asterisk/monitor
 
 volumes:

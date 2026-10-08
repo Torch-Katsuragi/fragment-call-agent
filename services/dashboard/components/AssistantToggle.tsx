@@ -1,11 +1,11 @@
 "use client";
 
-import { ANSWER_MODE_UI, ModeButtons, useAnswerMode } from "./AnswerModeControl";
+import { ANSWER_MODE_UI, ModeButtons, modeInfoText, useAnswerMode } from "./AnswerModeControl";
 
 // 設定ページの応答モード行。スイッチ本体はトップと共通の ModeButtons
 // (⚠トップと設定で別物にすると、片方だけ2値のまま取り残される — 実際にそうなっていた)。
 export default function AssistantToggle() {
-  const { mode, busy, choose } = useAnswerMode();
+  const { mode, info, busy, choose } = useAnswerMode();
   if (mode === null) {
     return (
       <div className="set-row">
@@ -19,6 +19,8 @@ export default function AssistantToggle() {
       <div className="set-row-text">
         <div className="set-row-title">応答モード</div>
         <div className="set-row-desc">{current.desc}</div>
+        {/* 時間割・時限があるときだけ (2026-09-29) */}
+        {info && info.source !== "fixed" && <div className="set-row-desc">{modeInfoText(info)}</div>}
       </div>
       <ModeButtons mode={mode} busy={busy} choose={choose} />
     </div>

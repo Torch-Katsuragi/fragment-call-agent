@@ -47,8 +47,8 @@ def is_untouched(text: str) -> tuple[bool, str]:
     if body:
         return False, f"メモが書かれている ({body[:20]}…)"
 
-    # 「最近の用件」以降
-    recent = text.split("## 最近の用件", 1)
+    # 「最近の用件」以降 (2026-09-26 から見出しに「（自動）」が付く)
+    recent = re.split(r"^## 最近の用件(?:（自動）)?[ \t]*$", text, maxsplit=1, flags=re.M)
     if len(recent) > 1 and recent[1].strip():
         return False, f"用件が書かれている ({recent[1].strip()[:20]}…)"
 
@@ -65,10 +65,14 @@ def main() -> int:
         print(f"電話帳が見つかりません: {BOOK}")
         return 1
 
-    files = sorted(p for p in BOOK.glob("*.md") if p.is_file())
+    # 2026-09-26 から 連絡先/<番号>/<番号>.md (フォルダごと動かす)。旧形式 連絡先/<番号>.md も見る
+    files = sorted(p for p in BOOK.glob("*.md") if p.is_file() and re.fullmatch(r"[+0-9]{4,20}", p.stem))
+    files += sorted(d / f"{d.name}.md" for d in BOOK.iterdir() if d.is_dir() and (d / f"{d.name}.md").exists())
     move, keep = [], []
     for p in files:
         untouched, why = is_untouched(p.read_text(encoding="utf-8"))
+        if untouched and p.parent != BOOK and any(q.stem != p.stem for q in p.parent.glob("*.md")):
+            untouched, why = False, "話した人のファイルがある"
         (move if untouched else keep).append((p, why))
 
     print(f"電話帳 {len(files)}件 → 残す {len(keep)}件 / 片付ける {len(move)}件\n")
@@ -85,7 +89,8 @@ def main() -> int:
 
     ATTIC.mkdir(parents=True, exist_ok=True)
     for p, _ in move:
-        p.rename(ATTIC / p.name)
+        src = p if p.parent == BOOK else p.parent  # 新しい形はフォルダごと
+        src.rename(ATTIC / src.name)
     print(f"\n{len(move)}件を {ATTIC} へ移動した (削除ではないので戻せる)")
     return 0
 

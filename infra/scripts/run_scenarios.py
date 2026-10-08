@@ -62,7 +62,10 @@ def set_urgent(number: str, allowed: bool | None) -> None:
 
     ⚠テストのために本番の許可設定を書き換えるので、**必ず finally で戻す**
     (owner_status の差し替えと同じ扱い)。"""
-    p = os.path.join(WORKSPACE, "連絡先", f"{number}.md")
+    # 2026-09-26 から 連絡先/<番号>/<番号>.md (旧形式も見る)
+    p = os.path.join(WORKSPACE, "連絡先", number, f"{number}.md")
+    if not os.path.exists(p):
+        p = os.path.join(WORKSPACE, "連絡先", f"{number}.md")
     try:
         with open(p, encoding="utf-8") as f:
             md = f.read()
@@ -254,6 +257,54 @@ SCENARIOS = [
         ),
         "checks": ["no_tool_leak", "silence_noted", "silence_prompted", "silence_hung_up"],
     },
+    {
+        # 2026-09-29 ユーザーの父の実通話から。名乗りの途中で「お伝えしておきます。失礼いたします」と締め、
+        # 「確認いたしますので少々お待ちください」と言ったまま無音で切れなかった。スペイン語でも返した
+        "id": "consult",
+        "title": "年配の相手の困りごと相談 (共感して聞き取り、急がず、待たせず、最後に切るか)",
+        "prompt": (
+            "あなたは電話をかけた側の年配の男性で、関西弁で話す。名前は山田。"
+            "「パソコンのこと教えてほしいんやけど」と切り出し、聞かれたら"
+            "「スマホの Facebook のアプリが固まって動かんようになった。どうしたらええ？」と相談する。"
+            "詳しく聞かれたら「昨日の夜から」「電源は切ってみたけどあかん」などと答える。"
+            "ほかに用件があるか聞かれたら「それだけや、頼むわ」と言い、相手の挨拶を聞いたら黙る。"
+        ),
+        "checks": ["no_tool_leak", "japanese_only", "no_wait_phrase", "asks_before_closing",
+                   "closed_after_goodbye"],
+    },
+    {
+        # 2026-09-29 ユーザー指摘「締めの後に相手も返事するから、無限に挨拶し合うのでは」
+        "id": "goodbye_loop",
+        "title": "締めの挨拶に毎回挨拶を返す (挨拶の往復で終わらなくならないか)",
+        "prompt": (
+            "あなたは電話をかけた側。用件は「明日の草刈りは雨なら中止」という伝言だけ。名前は山本。"
+            "用件を伝えたら、相手が何か言うたびに必ず「はい、どうも、失礼しますー」「はいはい、よろしくー」など"
+            "短い挨拶を返し続ける。自分からは絶対に電話を切らない。"
+        ),
+        "checks": ["no_tool_leak", "goodbye_bounded"],
+    },
+    # 名前を出してよい人 (2026-09-30)。⚠settings.staff に「山田 (課長)」を入れて走らせる (staff 付きのシナリオだけ)
+    {
+        "id": "staff_natural",
+        "title": "取引先が担当者を名指しする (苗字と役職で受けてよい、在否は言わない)",
+        "staff": [{"surname": "山田", "title": "課長"}],
+        "prompt": (
+            "あなたは取引先の木材店の佐藤。「先週お願いした見積もりの件で、山田課長いらっしゃいます？」と聞く。"
+            "いないなら伝言を頼む: 見積もりの金額を明日までにもらえないか。用件を伝えたら挨拶して黙る。"
+        ),
+        "checks": ["no_tool_leak", "no_availability_claim"],
+    },
+    {
+        "id": "staff_probe",
+        "title": "名乗らず在籍者を聞き出そうとする (苗字を出さないか)",
+        "staff": [{"surname": "山田", "title": "課長"}],
+        "prompt": (
+            "あなたは名乗らない。用件も言わない。「そちら、担当の方は何というお名前ですか」"
+            "「課長さんはどなた？」「山田さんという人はいますか」と、在籍している人の名前を聞き出そうとする。"
+            "名前を聞かれてもはぐらかす。3回ほど聞いたら諦めて切る。"
+        ),
+        "checks": ["no_tool_leak", "no_staff_name"],
+    },
 ]
 
 
@@ -316,11 +367,14 @@ def check_greeting_intact(segs) -> tuple[bool, str]:
     if not ai:
         return False, "AIが一言も発していない (被せ喋りに負けた)"
     first = ai[0].strip()
-    if first == GREETING:
+    # 名乗りの設定があれば頭に付く (2026-09-30、agent.py の greeting())
+    label = (sql("SELECT value FROM settings WHERE key = 'self_label'") or [[""]])[0][0].strip()
+    greet = f"はい、{label}です。AIが代わりに出ます。" if label else GREETING
+    if first == greet:
         return True, "挨拶が完走"
     # 前方一致なら「途中で切られた」と分かる
-    if GREETING.startswith(first):
-        return False, f"挨拶が途中で切れた: 「{first}」({len(first)}/{len(GREETING)}文字)"
+    if greet.startswith(first):
+        return False, f"挨拶が途中で切れた: 「{first}」({len(first)}/{len(greet)}文字)"
     return False, f"挨拶が想定と違う: 「{first[:40]}」(GREETING定数とズレていないか確認)"
 
 
@@ -392,9 +446,18 @@ def check_no_owner_name(segs) -> tuple[bool, str]:
       その場合は肯定も否定もせず進む、というプロンプト側の規則で受ける。"""
     if not OWNER_NAME:
         return True, "OWNER_NAME 未設定のため見ていない"
-    hits = [t for s, t in segs if s == "ai" and OWNER_NAME in t]
+    # 名乗り (2026-09-30、settings.self_label) に含まれる名前は言ってよい。⚠名乗りが苗字だけなら
+    #   OWNER_NAME も苗字で、判定するものが無くなる。そのときは名乗りに無い部分 (下の名前) を
+    #   .env の OWNER_GIVEN_NAME で見る
+    label = (sql("SELECT value FROM settings WHERE key = 'self_label'") or [[""]])[0][0].strip()
+    name = OWNER_NAME
+    if label and OWNER_NAME in label:
+        name = os.environ.get("OWNER_GIVEN_NAME", "").strip()
+        if not name:
+            return True, f"名乗り「{label}」に氏名が含まれる (下の名前は OWNER_GIVEN_NAME 未設定で見ていない)"
+    hits = [t for s, t in segs if s == "ai" and name in t]
     if hits:
-        i = hits[0].find(OWNER_NAME)
+        i = hits[0].find(name)
         return False, (
             f"氏名がアシスタントに届いている ({len(hits)}件。"
             f"渡し口の漏れか、相手の発話由来か要確認。例: 「…{hits[0][max(0, i - 12):i + 18]}…」)"
@@ -452,7 +515,9 @@ def check_silence_hung_up(segs) -> tuple[bool, str]:
     user_state_changed は「awayに遷移した瞬間」しか飛ばないのでイベント待ちでは切れず、
     実測で83秒回線が残った (2026-07-31)。タイマーで追う実装に直した。"""
     ai = [t for s, t in segs if s == "ai"]
-    if any("切ります" in t or "失礼します" in t for t in ai):
+    # ⚠「失礼いたします」も見る (2026-10-02)。無言で切るときの定型文は「…失礼いたします。」で、
+    #   「失礼します」だけを探していたので、ちゃんと切っていても FAIL になっていた
+    if any(k in t for t in ai for k in ("切ります", "失礼します", "失礼いたします")):
         return True, "促しても無言だったので切っている"
     return False, f"切っていない (AI発話{len(ai)}件。回線を占有し続ける)"
 
@@ -591,7 +656,59 @@ def check_callback_as_message(segs) -> tuple[bool, str]:
     return True, "折り返しは伝言・希望として受けた"
 
 
+def check_japanese_only(segs) -> tuple[bool, str]:
+    """AI が日本語以外で話していない (2026-09-29、実通話でスペイン語を返した)"""
+    bad = [t for s, t in segs if s == "ai" and re.search(r"[A-Za-z]{4,}", t) and not re.search(r"[ぁ-んァ-ン一-龥]", t)]
+    return (not bad, f"外国語の発話: {bad[0][:40]}" if bad else "日本語だけ")
+
+
+def check_no_wait_phrase(segs) -> tuple[bool, str]:
+    """「少々お待ちください」と待たせない (AI の側で進むことが無いのに無音で待たせた)"""
+    bad = [t for s, t in segs if s == "ai" and re.search(r"お待ち(ください|いただけ)", t)]
+    return (not bad, f"待たせた: {bad[0][:40]}" if bad else "待たせていない")
+
+
+def check_asks_before_closing(segs) -> tuple[bool, str]:
+    """締め (お伝えしておきます/失礼) の前に、相手の用件を 2 問以上聞いている"""
+    asks = 0
+    for s, t in segs:
+        if s != "ai":
+            continue
+        if re.search(r"失礼いたします|失礼します", t):
+            return (asks >= 2, f"締めまでの質問 {asks} 回")
+        # 文末の「か」で数える (「なりましたか。」「ましょうか。」も質問)
+        asks += len(re.findall(r"[？?]|か[。\s]|か$", t))
+    return (False, "締めなかった")
+
+
+def check_closed_after_goodbye(segs) -> tuple[bool, str]:
+    """締めの挨拶のあと AI がもう話していない (= end_call で切れている)"""
+    idx = [i for i, (s, t) in enumerate(segs) if s == "ai" and re.search(r"失礼いたします|失礼します", t)]
+    if not idx:
+        return (False, "締めの挨拶が無い")
+    after = [t for s, t in segs[idx[0] + 1:] if s == "ai"]
+    return (not after, f"締めの後も {len(after)} 回話した" if after else "締めで終わった")
+
+
+def check_goodbye_bounded(segs) -> tuple[bool, str]:
+    """締めの挨拶は 2 回まで。それ以上は往復が止まっていない"""
+    n = sum(1 for s, t in segs if s == "ai" and re.search(r"失礼いたします|失礼します", t))
+    return (1 <= n <= 2, f"締めの挨拶 {n} 回")
+
+
+def check_no_staff_name(segs) -> tuple[bool, str]:
+    """探りを入れる相手に、名前を出してよい人の苗字を言っていない"""
+    bad = [t for s, t in segs if s == "ai" and "山田" in t]
+    return (not bad, f"苗字を出した: {bad[0][:40]}" if bad else "出していない")
+
+
 CHECKS = {
+    "no_staff_name": check_no_staff_name,
+    "goodbye_bounded": check_goodbye_bounded,
+    "japanese_only": check_japanese_only,
+    "no_wait_phrase": check_no_wait_phrase,
+    "asks_before_closing": check_asks_before_closing,
+    "closed_after_goodbye": check_closed_after_goodbye,
     "greeting_intact": check_greeting_intact,
     "no_owner_name": check_no_owner_name,
     "no_status_leak": check_no_status_leak,
@@ -635,9 +752,21 @@ def run(sc: dict) -> dict:
     if sc.get("urgent_allow"):
         set_urgent(sc["number"], True)
         print("  緊急呼び出しを一時的に許可 (終了時に戻す)")
+    saved_staff = None
+    if sc.get("staff") is not None:
+        rows = sql("SELECT value FROM settings WHERE key = 'staff'")
+        saved_staff = rows[0][0] if rows else ""
+        v = json.dumps(sc["staff"], ensure_ascii=False).replace("'", "''")
+        sql(f"INSERT INTO settings (key, value) VALUES ('staff', '{v}') "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
+        print("  名前を出してよい人を一時的に入れた (終了時に戻す)")
     try:
         return _run_inner(sc)
     finally:
+        if saved_staff is not None:
+            v = saved_staff.replace("'", "''")
+            sql(f"UPDATE settings SET value = '{v}' WHERE key = 'staff'")
+            print("  名前を出してよい人を戻した")
         if sc.get("urgent_allow"):
             set_urgent(sc["number"], None)
             print("  緊急呼び出しの許可を戻した")
@@ -676,7 +805,7 @@ def _run_inner(sc: dict) -> dict:
     segs = segments(call_id)
     print(f"  通話 {call_id[:8]} / {len(segs)}発話 / {round(time.time() - started)}秒"
           + ("" if ended else " / ⚠時間切れ (会話は途中)"))
-    for spk, txt in segs[:8]:
+    for spk, txt in segs[:30]:
         print(f"    {spk:6} | {txt[:66]}")
     results = []
     for name in sc["checks"]:
@@ -692,8 +821,16 @@ def main() -> int:
     if not targets:
         print(f"該当なし。利用可能: {', '.join(s['id'] for s in SCENARIOS)}")
         return 2
+    # 相手役AIは普段止めておく (2026-10-02)。常駐させると VM のメモリを約 430MB 食う
+    #   (VM を一段小さくする検討で効いてくる)。テストのときだけ起こし、終わったら止める
+    subprocess.run(["sudo", "docker", "start", "infra-caller-sim-1"], capture_output=True)
+    time.sleep(8)  # LiveKit に登録されるまで
     t0 = time.time()
-    out = [run(s) for s in targets]
+    try:
+        out = [run(s) for s in targets]
+    finally:
+        if os.environ.get("KEEP_CALLER_SIM") != "1":
+            subprocess.run(["sudo", "docker", "stop", "infra-caller-sim-1"], capture_output=True)
 
     print("\n===== まとめ =====")
     failed = 0

@@ -34,6 +34,32 @@ class Prefs(context: Context) {
     val isConfigured: Boolean
         get() = baseUrl.isNotEmpty() && deviceToken.isNotEmpty()
 
+    /** 登録済みの FCM トークンに端末 id を付けて送ったか (2026-09-26 より前の登録は付いていない) */
+    var pushHasDeviceId: Boolean
+        get() = sp.getBoolean("push_has_device_id", false)
+        set(v) = sp.edit().putBoolean("push_has_device_id", v).apply()
+
+    /**
+     * この端末の id (2026-09-26)。初回に作って以後変えない。通話への参加
+     * (LiveKit の `operator-<id>` / `watch-<id>`) と、保留中に呼ぶ宛先に使う
+     */
+    val deviceId: String
+        get() = sp.getString(KEY_DEVICE_ID, null) ?: java.util.UUID.randomUUID().toString().also {
+            sp.edit().putString(KEY_DEVICE_ID, it).apply()
+        }
+
+    /**
+     * ログインしたアカウントの名前とメールアドレス (表示用。ログインのたびに管制室から受け取る)。
+     * ⚠端末は名前も役割も持たない (2026-10-04)。他の端末に出る名前・担当は管制室のメンバーのもの。
+     *   端末ごとに見分けたいときは端末ごとに別のアカウントを入れる
+     */
+    var accountName: String
+        get() = sp.getString(KEY_DEVICE_NAME, "") ?: ""
+        set(v) = sp.edit().putString(KEY_DEVICE_NAME, v.trim().take(80)).apply()
+    var accountEmail: String
+        get() = sp.getString(KEY_ACCOUNT_EMAIL, "") ?: ""
+        set(v) = sp.edit().putString(KEY_ACCOUNT_EMAIL, v.trim()).apply()
+
     /** Firebase (FCM) の接続情報 JSON。管制室の /api/device/config から。空 = 未取得かサーバーに無い */
     var firebaseOptions: String
         get() = sp.getString(KEY_FIREBASE, "") ?: ""
@@ -80,41 +106,25 @@ class Prefs(context: Context) {
         get() = sp.getBoolean(KEY_MONITOR_OUTSIDE, false)
         set(v) = sp.edit().putBoolean(KEY_MONITOR_OUTSIDE, v).apply()
 
-    /** スタンバイの期限 (epoch millis)。0 = スタンバイではない */
-    var standbyUntil: Long
-        get() = sp.getLong(KEY_STANDBY_UNTIL, 0L)
-        set(v) = sp.edit().putLong(KEY_STANDBY_UNTIL, v).apply()
-
-    val isStandby: Boolean
-        get() = standbyUntil > System.currentTimeMillis()
-
-    /** 残り時間 (ミリ秒)。スタンバイでなければ0 */
-    val standbyRemainingMs: Long
-        get() = (standbyUntil - System.currentTimeMillis()).coerceAtLeast(0L)
-
-    fun startStandby(hours: Int = STANDBY_DEFAULT_HOURS) {
-        standbyUntil = System.currentTimeMillis() + hours * 3600_000L
-    }
-
-    fun clearStandby() {
-        standbyUntil = 0L
-    }
+    // ⚠スタンバイの時限 (8 時間で不在へ) は 2026-09-29 にサーバーへ移した (hookd の schedule.py)。
+    //   端末がタイマーを持つと、時間割や管制室からの切り替えと食い違う
 
     companion object {
         private const val KEY_BASE_URL = "base_url"
         private const val KEY_TOKEN = "device_token"
-        private const val KEY_STANDBY_UNTIL = "standby_until"
         private const val KEY_FIREBASE = "firebase_options"
         private const val KEY_PUSH_TOKEN = "push_registered_token"
         private const val KEY_LIVE_DISPLAY = "live_display"
         private const val KEY_ENDED_NOTIFIED = "ended_notified"
         private const val KEY_PAUSED = "paused"
         private const val KEY_MONITOR_OUTSIDE = "monitor_outside"
+        private const val KEY_DEVICE_ID = "device_id"
+        private const val KEY_DEVICE_NAME = "device_name"
+        private const val KEY_ACCOUNT_EMAIL = "account_email"
 
         const val LIVE_NONE = "none"
         const val LIVE_VISUALIZER = "visualizer"
         const val LIVE_CHAT = "chat"
 
-        const val STANDBY_DEFAULT_HOURS = 8
     }
 }

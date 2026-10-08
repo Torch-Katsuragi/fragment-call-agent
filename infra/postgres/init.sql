@@ -117,14 +117,59 @@ INSERT INTO settings (key, value) VALUES ('assistant_enabled', 'true') ON CONFLI
 INSERT INTO settings (key, value) VALUES ('tts_primary', '') ON CONFLICT (key) DO NOTHING;
 INSERT INTO settings (key, value) VALUES ('tts_fallback', '') ON CONFLICT (key) DO NOTHING;
 
--- スマホアプリのプッシュトークン (FCM、2026-09-18)。着信と取り次ぎの瞬間に hookd が「起きろ」を送る。
--- ⚠既存DBには hookd の起動時 (push.DDL) で入る
-CREATE TABLE IF NOT EXISTS device_push_tokens (
-  token       text PRIMARY KEY,
+-- ===== 待機・視聴・会話と保留 (2026-09-26) =====
+-- 説明と稼働中 DB への適用は services/agent/presence.py (hookd の起動時に同じ DDL を流す)。
+-- 片方だけ直すと両者がずれるので、変更時は必ず両方を直すこと。
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS ai_on boolean;
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS handler text;            -- ai / human / hold / connecting
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS hold_since timestamptz;
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS presence jsonb NOT NULL DEFAULT '[]'::jsonb;
+-- 通話ごとの相手の呼び名 (2026-09-26)。同じ番号でも話した人は通話ごとに違う (組織の番号)。
+-- NULL = 電話帳の名前のままでよい。worker が終話後に書く
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS caller_label text;
+-- 録音 (2026-10-02)。ワークスペースからの相対パス (録音/YYYY-MM/....ogg)。NULL = 無い・消した。
+-- worker (recordings.py) が書き、管制室が再生に使う
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_path text;
+-- 通話で会話した人の名前 (2026-10-04)。agent が担い手の変わり目ごとに足す
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS handled_by jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+-- ===== メンバー・招待・端末のログイン (2026-09-26) =====
+-- 説明は services/agent/members.py (hookd の起動時に同じ DDL を流す)。片方だけ直さないこと
+
+CREATE TABLE IF NOT EXISTS members (
+  id          bigserial PRIMARY KEY,
+  email       text NOT NULL UNIQUE,
   name        text NOT NULL DEFAULT '',
-  platform    text NOT NULL DEFAULT 'android',
-  created_at  timestamptz NOT NULL DEFAULT now(),
-  updated_at  timestamptz NOT NULL DEFAULT now()
+  role        text NOT NULL DEFAULT 'viewer',
+  status      text NOT NULL DEFAULT 'active',
+  invited_by  bigint,
+  created_at  timestamptz NOT NULL DEFAULT now()
 );
--- 端末ごとの一時停止 (2026-09-24)。true の端末には「起きろ」を送らない
-ALTER TABLE device_push_tokens ADD COLUMN IF NOT EXISTS paused boolean NOT NULL DEFAULT false;
+-- 人ごとの受付時間 (2026-09-29、services/agent/schedule.py)。null = いつでも
+ALTER TABLE members ADD COLUMN IF NOT EXISTS hours jsonb;
+CREATE TABLE IF NOT EXISTS invites (
+  token_hash  text PRIMARY KEY,
+  email       text NOT NULL,
+  role        text NOT NULL,
+  created_by  bigint,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  expires_at  timestamptz NOT NULL,
+  accepted_at timestamptz,
+  revoked_at  timestamptz,
+  mailed_at   timestamptz
+);
+CREATE TABLE IF NOT EXISTS device_sessions (
+  token_hash  text PRIMARY KEY,
+  member_id   bigint NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+  device_id   text NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  last_seen   timestamptz NOT NULL DEFAULT now(),
+  revoked_at  timestamptz
+);
+-- ⚠端末は名前も役割も持たない (2026-10-04 ユーザー「端末ごとに見分けたいなら端末ごとに別のアカウントを入れればいい」)。
+--   担当は人 (members.duty) に移す。端末ごとの権限の上限 (同日に足した role_cap) もやめた
+ALTER TABLE members ADD COLUMN IF NOT EXISTS duty text NOT NULL DEFAULT '';
+ALTER TABLE device_sessions DROP COLUMN IF EXISTS role_cap;
+-- 端末の情報はログインの行だけに持つ (2026-10-04)。起こす宛先 (FCM) と一時停止もここ
+ALTER TABLE device_sessions ADD COLUMN IF NOT EXISTS push_token text;
+ALTER TABLE device_sessions ADD COLUMN IF NOT EXISTS paused boolean NOT NULL DEFAULT false;

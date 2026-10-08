@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.CallMade
 import androidx.compose.material.icons.rounded.CallReceived
 import androidx.compose.material.icons.rounded.Person
@@ -261,67 +262,107 @@ fun formatDateTime(ms: Long): String {
     return "${t.monthValue}/${t.dayOfMonth} ${t.format(hm)}"
 }
 
-/** 通話一覧の1行 (ホームと履歴) */
+/**
+ * 通話一覧の1行 (2026-09-26 に展開式へ)。
+ *   閉じているとき … 名前 (無ければ番号)、名前があれば番号を小さく、誰が応対したか・長さ
+ *   頭を押す      … 展開して要約を出す。要約は少し色を付け、押すと会話 (通話画面) へ
+ *   頭をもう一度押す … 閉じる
+ * ⚠通話中の行は展開しない (押せばそのまま通話画面)
+ */
 @Composable
-fun CallRow(call: FragmentApi.Call, clock: Boolean = false, onClick: () -> Unit) {
+fun CallRow(
+    call: FragmentApi.Call,
+    expanded: Boolean = false,
+    onToggle: () -> Unit = {},
+    onOpen: () -> Unit,
+) {
     val sem = LocalSemantic.current
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(horizontal = 18.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Avatar(call.name, size = 44.dp)
-        Spacer(Modifier.width(14.dp))
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    call.displayName,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                Spacer(Modifier.width(8.dp))
-                if (call.active) {
-                    LiveDot()
-                    Spacer(Modifier.width(6.dp))
-                    Text("通話中", style = MaterialTheme.typography.labelMedium, color = sem.live)
-                } else {
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = if (call.active) onOpen else onToggle)
+                .padding(horizontal = 18.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Avatar(call.callerLabel ?: call.name ?: call.lookupName, size = 44.dp)
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        if (clock) formatDateTime(call.startedAt).substringAfter(' ') else formatWhen(call.startedAt),
-                        style = MaterialTheme.typography.labelMedium,
+                        call.displayName,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    if (call.active) {
+                        LiveDot()
+                        Spacer(Modifier.width(6.dp))
+                        Text("通話中", style = MaterialTheme.typography.labelMedium, color = sem.live)
+                    } else {
+                        Text(
+                            formatDateTime(call.startedAt).substringAfter(' '),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(Modifier.size(2.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Icon(
+                        if (call.outbound) Icons.Rounded.CallMade else Icons.Rounded.CallReceived,
+                        contentDescription = if (call.outbound) "発信" else "着信",
+                        modifier = Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        callSubtitle(call),
+                        style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             }
-            Spacer(Modifier.size(2.dp))
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        }
+        if (expanded && !call.active) {
+            // 要約。無い通話 (要約を作る前・作れなかった) は直近の発話で代える
+            val body = call.summary?.takeIf { it.isNotBlank() }
+                ?: call.segments.filter { it.speaker == "caller" || it.speaker == "ai" || it.speaker == "user" }
+                    .joinToString("\n") { "${speakerLabel(it.speaker)}: ${it.text}" }
+                    .ifEmpty { "発話はありません" }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 76.dp, end = 14.dp, bottom = 12.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f))
+                    .clickable(onClick = onOpen)
+                    .padding(start = 12.dp, end = 6.dp, top = 10.dp, bottom = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                 Icon(
-                    if (call.outbound) Icons.Rounded.CallMade else Icons.Rounded.CallReceived,
-                    contentDescription = if (call.outbound) "発信" else "着信",
-                    modifier = Modifier.size(14.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    callSubtitle(call),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                    contentDescription = "会話を開く",
+                    tint = MaterialTheme.colorScheme.primary,
                 )
             }
         }
     }
 }
 
-/** 「AI · 2分13秒 · 最後の一言」 */
+/**
+ * 「山田建設 · 0312345678 · AI · 2分13秒」。
+ * この通話の相手の呼び名 (callerLabel) を大きく出しているときは、電話帳の名前を小さく添える。番号は名前が分かっているときだけ
+ */
 private fun callSubtitle(c: FragmentApi.Call): String {
-    val who = if (c.outbound || c.answeredByMe) "あなた" else "AI"
-    val parts = mutableListOf(who)
+    val parts = mutableListOf<String>()
+    if (c.callerLabel != null) c.registeredName?.let { parts += it }
+    if ((c.hasName || c.callerLabel != null) && c.number != null) parts += c.number
+    parts += if (c.outbound || c.answeredByMe) "あなた" else "AI"
     c.endedAt?.let { parts += formatDuration((it - c.startedAt) / 1000) }
-    c.segments.lastOrNull { it.speaker == "caller" || it.speaker == "ai" || it.speaker == "user" }
-        ?.text?.let { parts += it }
     return parts.joinToString(" · ")
 }

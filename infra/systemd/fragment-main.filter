@@ -1,0 +1,2 @@
+# fragment-bisync のフィルタ (VM の ~/.config/rclone/ へ置く)。録音は fragment-rec-bisync が受け持つ
+- 録音/**

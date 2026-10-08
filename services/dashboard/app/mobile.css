@@ -354,13 +354,6 @@
   .set-row.inline .slider-ctl input[type="range"] {
     width: 110px;
   }
-  .pair-ctl {
-    width: 100%;
-  }
-  .pair-ctl input {
-    flex: 1;
-    width: auto;
-  }
   /* ⚠スマホ用の「ボタンは高さ 44px 以上」がスイッチにも掛かって丸く潰れていた (2026-09-24 実機)。
      スイッチは形が意味なので寸法を固定する。指で押しやすいよう少しだけ大きく */
   .set-row .switch {

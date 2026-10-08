@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.History
+import androidx.compose.material.icons.rounded.Contacts
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
@@ -44,7 +45,7 @@ import jp.sleeptree.fragment.WatchService
 import jp.sleeptree.fragment.audio.CallAudio
 
 /**
- * アプリ本体。ホーム / 履歴 / 設定 のタブと、その上に重ねる通話画面・発信画面。
+ * アプリ本体。ホーム / 設定 のタブと、その上に重ねる通話画面・発信画面。
  *
  * ⚠2026-09-24 に管制室の WebView をやめて全部ネイティブにした (ユーザー「webページ経由はなしにして
  *   kotlinでちゃんとUIとかデザインしよう」)。きっかけは通話音声 (audio/CallAudio.kt の注記)。
@@ -205,7 +206,8 @@ sealed interface Overlay {
     data class Dialer(val number: String = "") : Overlay
 }
 
-private enum class Tab(val label: String) { HOME("ホーム"), HISTORY("履歴"), SETTINGS("設定") }
+// ⚠履歴タブは 2026-09-26 にやめた。ホームが下へ無限に続く。代わりに電話帳
+private enum class Tab(val label: String) { HOME("ホーム"), CONTACTS("電話帳"), SETTINGS("設定") }
 
 @Composable
 private fun App(prefs: Prefs, overlay: Overlay?, setOverlay: (Overlay?) -> Unit, foreground: Boolean) {
@@ -235,7 +237,7 @@ private fun App(prefs: Prefs, overlay: Overlay?, setOverlay: (Overlay?) -> Unit,
                                 Icon(
                                     when (t) {
                                         Tab.HOME -> Icons.Rounded.Home
-                                        Tab.HISTORY -> Icons.Rounded.History
+                                        Tab.CONTACTS -> Icons.Rounded.Contacts
                                         Tab.SETTINGS -> Icons.Rounded.Settings
                                     },
                                     contentDescription = null,
@@ -257,11 +259,14 @@ private fun App(prefs: Prefs, overlay: Overlay?, setOverlay: (Overlay?) -> Unit,
                         paused = paused,
                         onResume = { paused = false; jp.sleeptree.fragment.DevicePause.set(ctx, false) },
                         onOpenCall = { setOverlay(Overlay.Call(it)) },
-                        onOpenHistory = { tab = Tab.HISTORY },
                         onOpenSettings = { tab = Tab.SETTINGS },
                         onDial = { setOverlay(Overlay.Dialer()) },
                     )
-                    Tab.HISTORY -> HistoryScreen(prefs = prefs, onOpenCall = { setOverlay(Overlay.Call(it)) })
+                    Tab.CONTACTS -> ContactsScreen(
+                        prefs = prefs,
+                        onOpenCall = { setOverlay(Overlay.Call(it)) },
+                        onDial = { setOverlay(Overlay.Dialer(it)) },
+                    )
                     Tab.SETTINGS -> SettingsScreen(
                         prefs = prefs,
                         paused = paused,

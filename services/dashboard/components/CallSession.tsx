@@ -23,6 +23,8 @@ type Ctx = {
   operator: boolean;
   toggleOperator: () => void;
   requestOperator: () => void;
+  /** 会話から抜ける (AI 応答はオフのまま = 保留) */
+  leaveToHold: () => void;
 };
 
 const CallSessionCtx = createContext<Ctx>({
@@ -31,6 +33,7 @@ const CallSessionCtx = createContext<Ctx>({
   operator: false,
   toggleOperator: () => {},
   requestOperator: () => {},
+  leaveToHold: () => {},
 });
 
 export const useCallSession = () => useContext(CallSessionCtx);
@@ -95,9 +98,23 @@ export default function CallSessionProvider({ children }: { children: React.Reac
       });
   }, [activeCall, conn, operator]);
 
-  const toggleOperator = () => {
-    setConn(null); // 権限の違うトークンで再接続 (operator切断はagent側でhandback検知)
+  // 自分が出る ⇔ AIに任せる。⚠2026-09-26 から会話中の人が抜けただけでは AI は戻らない (保留になる)。
+  //   「AIに任せる」は AI 応答をオンにしてから抜ける (services/agent/presence.py)
+  const toggleOperator = async () => {
+    if (operator && activeCall) {
+      await fetch(`/api/calls/${activeCall.id}/ai`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ on: true }),
+      }).catch(() => {});
+    }
+    setConn(null); // 権限の違うトークンで再接続
     setOperator((o) => !o);
+  };
+  const leaveToHold = () => {
+    if (!operator) return;
+    setConn(null);
+    setOperator(false);
   };
   const requestOperator = () => {
     if (!operator) {
@@ -106,7 +123,14 @@ export default function CallSessionProvider({ children }: { children: React.Reac
     }
   };
 
-  const ctx: Ctx = { activeCall, connected: !!conn, operator, toggleOperator, requestOperator };
+  const ctx: Ctx = {
+    activeCall,
+    connected: !!conn,
+    operator,
+    toggleOperator,
+    requestOperator,
+    leaveToHold,
+  };
   const onCallPage = activeCall !== null && pathname === `/call/${activeCall.id}`;
   // スマホのロック画面用の軽量表示 (/live/<id>)。チップは出さない。音は設定次第 (audible に含めない)
   const onLivePage = pathname.startsWith("/live/");

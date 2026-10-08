@@ -6,6 +6,7 @@
      - バックエンド auto: agy (Antigravity CLI) があれば使い、無ければ Gemini API 直呼び
   2. 終了した通話の文字起こしをDBから ワークスペース/通話記録/*.md に書き出す
      (ワークスペースを Drive などで同期すれば、他のツールや AI とも共有できる)
+  3. 通話の録音を ワークスペース/録音/ へ移し、管制室の指定で消す (recordings.py)
 
 起動: python services/directory-agent/worker.py  (リポジトリどこからでも可)
 環境変数: DATABASE_URL / GOOGLE_API_KEY (無ければリポジトリ直下の .env から読む)
@@ -22,12 +23,16 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncpg
+
+import phonebook as pb
+import recordings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("directory-agent")
@@ -89,6 +94,13 @@ def gather_workspace(max_chars: int = 40000) -> str:
     dirs = ["共有メモ", "連絡先", "受信箱"]
     files: list[Path] = []
     for d in dirs:
+        if d == "連絡先":
+            # 2026-09-26 から 連絡先/<番号>/<番号>.md と 連絡先/<番号>/<人>.md。⚠_未使用/ は読まない
+            files.extend(
+                f for f in sorted((WORKSPACE / d).rglob("*.md"))
+                if "_未使用" not in f.parts
+            )
+            continue
         files.extend(sorted((WORKSPACE / d).glob("*.md")))
     records = sorted((WORKSPACE / "通話記録").glob("*.md"), reverse=True)[:10]
     files.extend(records)
@@ -107,7 +119,11 @@ def gather_workspace(max_chars: int = 40000) -> str:
 
 
 def call_gemini(
-    system_prompt: str, user_text: str, json_mode: bool = False, google_search: bool = False
+    system_prompt: str,
+    user_text: str,
+    json_mode: bool = False,
+    google_search: bool = False,
+    cached: str | None = None,
 ) -> str:
     # ⚠thinkingBudget:0 は使わない (2026-08-01)。3.5では黙って無視されていたが、
     #   **3.6は400で拒否する** — このワンパラメータでworkerのGemini呼び出しが全滅し、
@@ -122,6 +138,10 @@ def call_gemini(
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
         "generationConfig": gen_cfg,
     }
+    if cached:
+        # 明示キャッシュ (指示文と前半は登録済み)。⚠system_instruction は併記できない
+        del body["system_instruction"]
+        body["cachedContent"] = cached
     if google_search:
         # Google検索グラウンディング (⚠json_modeとは併用不可)
         body["tools"] = [{"google_search": {}}]
@@ -132,7 +152,19 @@ def call_gemini(
     )
     with urllib.request.urlopen(req, timeout=60) as res:
         data = json.loads(res.read().decode("utf-8"))
+    # 使った量を残す (2026-10-02、費用の内訳を測るため)。cached = 暗黙キャッシュに当たった分 (安い)
+    u = data.get("usageMetadata") or {}
+    log.info(
+        "gemini usage [%s]: prompt=%s cached=%s out=%s",
+        _PROMPT_TAGS.get(system_prompt, system_prompt[:12].replace("\n", " ")) + ("+cache" if cached else ""),
+        u.get("promptTokenCount"), u.get("cachedContentTokenCount", 0),
+        (u.get("candidatesTokenCount") or 0) + (u.get("thoughtsTokenCount") or 0),
+    )
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
+# usage のログで呼び出しの種類を見分ける名前 (定義後に埋める)
+_PROMPT_TAGS: dict[str, str] = {}
 
 
 def answer_with_gemini(question: str) -> str:
@@ -210,35 +242,199 @@ def resolve_backend() -> str:
     return "agy" if shutil.which("agy") else "gemini"
 
 
-PHONEBOOK_TEMPLATE = """---
-number: "{number}"
-name: 不明
-tags: [フラグメント, 電話帳]
----
+BOOK = pb.Book(WORKSPACE / "連絡先")
 
-# {number}
 
-## メモ
+KANA_PROMPT = """日本人の名前 (または店・会社の名前) の読みがなを、ひらがなで返します。
+姓と名の間は半角スペース。読みが複数ありうる字は、いちばんよくある読みにします。
+名前でないもの (「〇〇の携帯」「テスト用」などの説明) は、説明の部分も含めて全体を読みます。
+出力JSON: {"kana": "..."}"""
 
-(まだ情報なし。名前・関係・話し方の注意などをここに書く)
 
-## 最近の用件
+def fill_phonebook_kana() -> None:
+    """読みがなの無い電話帳md に kana を補う (1 回 1 件、2026-09-26)。アプリの電話帳の並び順に使う。
+    ⚠スマホの連絡先から登録したものは連絡先のふりがなが入っているので、ここに来るのはそれ以外
+    (手で作ったもの・ふりがなの無い連絡先)。推測なので、違っていたら md の kana を直せばよい"""
+    for number in BOOK.numbers():
+        p = BOOK.file(number)
+        try:
+            md = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        name, _ = pb.name_state(md)
+        if not name or name == "不明" or re.search(r"^kana:", md, re.M):
+            continue
+        try:
+            kana = str(json.loads(call_gemini(KANA_PROMPT, name, json_mode=True)).get("kana") or "").strip()
+        except Exception:
+            log.exception("kana failed: %s", number)
+            return
+        if not kana:
+            return
+        kana = re.sub(r"[\r\n\"]", " ", kana)[:60]
+        p = BOOK.ensure(number)  # 旧形式ならここで新しい形へ移る
+        md = p.read_text(encoding="utf-8")
+        p.write_text(re.sub(r"^(name:.*)$", lambda mm: f"{mm.group(1)}\nkana: {kana}", md, count=1, flags=re.M), encoding="utf-8")
+        log.info("kana %s: %s → %s", number, name, kana)
+        return
 
-"""
+
+def update_phonebook_after_call(c, summary: str, org: str, person: str, conflict: str = "") -> None:
+    """終話した通話で、相手の電話帳を更新する (2026-09-26。書き手の決まりは phonebook.py の冒頭)。
+    - 名前 (name) は**番号の持ち主**。組織の番号なら組織名で、そこからかけてくる個人は入れない
+      (ユーザー「組織の番号は何人も使うので、名前欄に『組織の誰々』と書くのは不適切」)。
+      「不明」のときだけ入れる。通話で名乗った組織 > 番号検索の名前 > (組織の手がかりが無ければ)
+      名乗った個人名。どこから取ったかを name_source に残す。人が書いた名前 (name_source が無い) は
+      触らない。番号検索の名前は、後の通話で組織を名乗られたらそちらに置き換える
+    - 話した人: 名乗った個人を 連絡先/<番号>/<人>.md に日付と用件つきで残す (個人の番号なら作らない)。
+      同じ人か迷ったら作らずに「未整理（自動）」へ
+    - 最近の用件（自動）: 要約を日付つきで 1 行足す (新しい順に 10 行まで)
+    - 番号検索（自動）: 検索結果の節を最新にする
+    - 食い違い（自動）: 番号検索や登録済みの名前と違う組織を名乗られたら ⚠ で残す (通話が正)
+    ⚠テスト通話 (ルーム名が sim) と、遡って要約した古い通話 (終話から 1 日より前) は触らない"""
+    number = c["caller_number"] or ""
+    if not pb.is_number(number) or c["room_name"].rsplit("_", 1)[-1].startswith("sim"):
+        return
+    if (datetime.now(timezone.utc) - c["ended_at"]).total_seconds() > 86400:
+        return
+    path = BOOK.ensure(number)
+    md = path.read_text(encoding="utf-8")
+    before = md
+    name, source = pb.name_state(md)
+    looked = latest_lookup_name(number)
+    t = c["started_at"].astimezone()
+    day = f"{t.month}/{t.day}"
+    # 登録済みの名前 (人が書いたもの・前の通話で名乗られたもの) と違う組織を名乗られたら、名前は変えずに
+    # 「食い違い（自動）」へ残す (2026-09-26 ユーザー「組織名の食い違いも ⚠ で残して」)。
+    # ⚠番号検索で入れた名前との食い違いは、下の lookup_conflict が扱う (名前は名乗りの方に直す)
+    if org and name not in ("", "不明") and source != "番号検索" and not pb.same_org(org, name):
+        md = pb.note_conflict(md, f"- ⚠ {day} の通話では「{org}」と名乗った (登録は「{name}」)")
+    if org and (name in ("", "不明") or source == "番号検索"):
+        md = pb.set_name(md, org, "通話で名乗った")
+    elif name in ("", "不明") and looked:
+        md = pb.set_name(md, looked, "番号検索")
+    elif name in ("", "不明") and person:
+        # 組織の手がかりが何も無い = 個人の電話と見なす
+        md = pb.set_name(md, person, "通話で名乗った")
+    line = f"- {day} {summary}" if summary else f"- {day} 通話"
+    owner, _ = pb.name_state(md)
+    if person and pb.norm_person(person) != pb.norm_person(owner):
+        # 人のファイルを先に書き、番号のファイルは書き直した後で読み直す (未整理に積まれることがある)
+        if md != before:
+            path.write_text(md, encoding="utf-8")
+            before = md
+        kind = BOOK.add_person_line(number, person, line)
+        log.info("phonebook person %s/%s: %s", number, person, kind)
+        md = path.read_text(encoding="utf-8")
+        before = md
+    md = pb.set_section(md, "話した人", BOOK.people_index(number))
+    md = set_lookup_section(md, number)
+    if conflict:
+        # 通話の内容を正とする。番号検索と違うことが言われたら、その旨を残す
+        md = pb.note_conflict(md, f"- ⚠ {day} 番号検索と食い違い: {conflict}")
+    if summary:
+        md = pb.add_to_section(md, "最近の用件", line, limit=10)
+    if md != before:
+        path.write_text(md, encoding="utf-8")
+        log.info("phonebook updated after call: %s", number)
+
+
+def latest_lookup_name(number: str) -> str | None:
+    """番号検索で分かった名前のうち新しいもの。⚠同期関数 (ファイル書き込みと同じスレッドで使う)"""
+    lk = _LOOKUP.get(number)
+    return lk["name"] if lk else None
+
+
+# 番号 → 名前が分かった番号検索の結果のうち新しいもの {name, summary, verdict, at}。30 秒ごとに作り直す。
+# ⚠名前の分からなかった回 (「情報なし」) は数えない — 同じ番号でも検索のたびに結果が揺れる
+#   (同じ番号で組織名と「該当なし」の両方が出た)
+_LOOKUP: dict[str, dict] = {}
+
+
+async def refresh_lookup_names(pool: asyncpg.Pool) -> None:
+    rows = await pool.fetch(
+        """SELECT DISTINCT ON (query) query, result, finished_at FROM agent_jobs
+           WHERE kind = 'number_lookup' AND status = 'done' AND result LIKE '%"name": "%'
+           ORDER BY query, id DESC"""
+    )
+    out = {}
+    for r in rows:
+        try:
+            j = json.loads(r["result"])
+        except Exception:
+            continue
+        if j.get("name"):
+            out[r["query"]] = {
+                "name": str(j["name"])[:40],
+                "summary": str(j.get("summary") or "")[:300],
+                "verdict": j.get("verdict") or "unknown",
+                "at": r["finished_at"],
+            }
+    _LOOKUP.clear()
+    _LOOKUP.update(out)
+
+
+def _lookup_text(number: str) -> str:
+    """プロンプトに渡す番号検索の結果 (無ければ空)"""
+    lk = _LOOKUP.get(number)
+    return f"{lk['name']} — {lk['summary']}" if lk else ""
+
+
+VERDICT_LABEL = {"normal": "通常", "sales": "営業", "scam": "詐欺の報告あり", "unknown": "不明"}
+
+
+def set_lookup_section(md: str, number: str) -> str:
+    """「## 番号検索（自動）」を最新の検索結果で書き直す (2026-09-26、ユーザー「検索結果をもとに
+    情報を充実させていい。そのうえで通話の内容を正として書き換えていく」)。
+    ⚠節の中の「⚠」で始まる行 (通話との食い違いの記録) は残す"""
+    lk = _LOOKUP.get(number)
+    if not lk:
+        return md
+    at = lk["at"].astimezone() if lk.get("at") else None
+    when = f" ({at.month}/{at.day} 調べ)" if at else ""
+    lines = [f"- {lk['name']}{when} · {VERDICT_LABEL.get(lk['verdict'], lk['verdict'])}"]
+    if lk["summary"]:
+        lines.append(f"- {lk['summary']}")
+    keep = [l for l in pb.section_items(md, "番号検索") if l.startswith("- ⚠")]
+    return pb.set_section(md, "番号検索", "\n".join(lines + keep))
+
+
+def fill_phonebook_names() -> None:
+    """番号検索で分かったことを電話帳に入れる (1 回 1 件)。名前が「不明」なら名前も。
+    通話の後の更新 (update_phonebook_after_call) より前からある番号の追いつき用"""
+    for number in BOOK.numbers():
+        try:
+            md = BOOK.file(number).read_text(encoding="utf-8")
+        except Exception:
+            continue
+        name, _ = pb.name_state(md)
+        looked = latest_lookup_name(number)
+        if not looked:
+            continue
+        next_md = md
+        if name in ("", "不明"):
+            next_md = pb.set_name(next_md, looked, "番号検索")
+        if not pb.section_items(next_md, "番号検索"):
+            next_md = set_lookup_section(next_md, number)
+        if next_md != md:
+            BOOK.ensure(number).write_text(next_md, encoding="utf-8")
+            log.info("phonebook enriched from lookup: %s (%s)", number, looked)
+            return
 
 
 def phonebook_path(number: str) -> Path | None:
-    if not re.fullmatch(r"[+0-9]{4,20}", number):
-        return None
-    return WORKSPACE / "連絡先" / f"{number}.md"
+    """番号のファイル (読む用。無ければ None)"""
+    return BOOK.file(number)
 
 
 async def build_caller_context(pool: asyncpg.Pool, number: str) -> str:
-    """着信時の下調べ: 電話帳md + 直近の通話の抜粋。LLMは通さず即答する。"""
+    """着信時の下調べ: 電話帳 (番号のファイル + 話した人のファイル) + 直近の通話の抜粋。LLMは通さず即答する。"""
     parts: list[str] = []
     p = phonebook_path(number)
-    if p and p.exists():
+    if p:
         parts.append(f"【電話帳メモ ({p.name})】\n{p.read_text(encoding='utf-8')[:4000]}")
+        for person in BOOK.people(number)[:8]:
+            parts.append(f"【この番号から話した人 ({person.stem})】\n{person.read_text(encoding='utf-8')[:1200]}")
     else:
         parts.append("【電話帳メモ】この番号のメモはまだ無い (記録上は初対面の可能性が高い)")
     rows = await pool.fetch(
@@ -279,6 +475,9 @@ async def process_jobs(pool: asyncpg.Pool) -> None:
         if job["kind"] == "caller_context":
             number = job["query"].split(":", 1)[-1]
             result = await build_caller_context(pool, number)
+        elif job["kind"] == "recording_delete":
+            # 管制室の「期間を指定して消す」(2026-10-02)。Gemini は使わない
+            result = await recordings.run_delete_job(pool, WORKSPACE, job["query"])
         else:
             fn = answer_with_agy if backend == "agy" else answer_with_gemini
             result = await loop.run_in_executor(None, fn, job["query"])
@@ -337,6 +536,9 @@ WATCHER_PROMPT = """あなたは{OWNER}の電話応対AI「フラグメント」
 - ⚠**約束をさせない**。「折り返すと伝えて」「今日中にと答えて」は禁止。
   アシスタントの仕事は伝言に終始することで、折り返すかどうかは記録を見た持ち主が決める
 - ⚠**相手の氏名を復唱させない**。「◯◯様ですね、と確認して」も不要 (記録に残る)
+- ⚠**間違い電話と決めつけない** (2026-09-30)。この電話は個人の携帯とは限らない (固定電話・組織の番号にも使う)。
+  「この電話について」の「名前を出してよい人」に載っている人宛てなら、正しい宛先。載っていない名前でも、
+  相手自身が別の宛先だと言わない限り、用件を伺う方へ進めさせる。「個人の電話」と言わせない
 
 # handoff — 本人の携帯を鳴らすか (取り次ぎの判断。判断層はあなたの担当)
 ⚠**これは持ち主が何をしていても中断させる重い操作。既定は false。**
@@ -386,7 +588,12 @@ false にするもの (伝言で受ければ足りる):
   - もう不要になった吹き出し → リストに含めない (画面から消える)
   - 新しい気づき → 追加する。まとめ直し・要約への置き換えも自由
 - kind は "info"(関連情報) / "alert"(注意・警戒) / "hint"(提案) を基本に自由
-- 画面が煩雑にならないよう、常時2〜6枚程度に整理する"""
+- 画面が煩雑にならないよう、常時2〜6枚程度に整理する
+- **番号検索と食い違ったら明記する** (2026-09-26): 「番号のweb検索結果」が付いていて、相手が名乗った
+  会社・団体・立場や話の内容がそれと食い違うときは、kind "alert"・title「番号検索と食い違い」の
+  吹き出しで「番号検索では〇〇。通話では△△と名乗っている」と両方を書く。通話の内容を正として扱う
+  (番号の使い回し・転送・なりすましのどれもありうるので、どちらが正しいかの断定はしない)。
+  個人名が加わっただけ (テナント → テナントの山田) は食い違いではない"""
 
 def parse_json_object(raw: str) -> dict:
     """LLMの出力から最初のJSONオブジェクトを取り出す。
@@ -432,8 +639,91 @@ def parse_json_object(raw: str) -> dict:
 _watch_seen: dict[str, int] = {}  # call_id -> 最後に処理した相手発話のseq
 
 
+async def line_identity(pool: asyncpg.Pool) -> str:
+    """この電話の名乗りと、名前を出してよい人 (2026-09-30、管制室の設定)。後方支援に渡す。
+    ⚠渡さないと、名乗りが個人の苗字のとき「個人の電話だから山田課長はいない、間違い電話として切れ」と
+      メモを出し、応対中の AI に伝言の途中で番号違いを言わせた (staff_natural シナリオで実測)"""
+    try:
+        rows = await pool.fetch("SELECT key, value FROM settings WHERE key IN ('self_label', 'staff')")
+    except Exception:
+        return ""
+    got = {r["key"]: r["value"] or "" for r in rows}
+    try:
+        staff = [s for s in json.loads(got.get("staff") or "[]") if isinstance(s, dict) and s.get("surname")]
+    except json.JSONDecodeError:
+        staff = []
+    names = "、".join(s["surname"] + (f" ({s['title']})" if s.get("title") else "") for s in staff)
+    return f"名乗り: {got.get('self_label') or '(なし)'}\n名前を出してよい人: {names or '(なし)'}"
+
+
+# 会話監視の明示キャッシュ (2026-10-02)。通話ごとに 指示文 + 管制室の設定 + ワークスペース を登録し、
+# 相手が話すたびの呼び出しでは残り (メモ・吹き出し・文字起こし) だけを送る。
+# なぜ: 監視は相手の発話ごとに約 9,000 トークンを丸ごと送っていて、暗黙キャッシュは 3.8-flash では
+#   一度も当たらなかった (同じ前半を 2 秒おきに 4 回送って cached=0)。明示キャッシュなら
+#   ほぼ全部が cached になる (13,020/13,031)。中身は同じ文章を 2 つに分けて渡すだけ
+# ⚠作れなかったら (短すぎる・API の失敗) 従来どおり全部送る。費用が戻るだけで動きは変わらない
+_watch_cache: dict[str, tuple[int, str]] = {}  # call id → (前半の hash, "cachedContents/…" か "")
+WATCH_CACHE_TTL = "1800s"  # 通話より長く。終話を見たら消す (消し損ねても TTL で消える)
+
+
+def _gemini_rest(method: str, path: str, body: dict | None = None) -> dict:
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/{path}",
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
+        method=method,
+        headers={"Content-Type": "application/json", "x-goog-api-key": GOOGLE_API_KEY},
+    )
+    with urllib.request.urlopen(req, timeout=30) as res:
+        raw = res.read()
+    return json.loads(raw) if raw else {}
+
+
+def _watch_cache_for(call_key: str, prefix: str) -> str | None:
+    h = hash(prefix)
+    got = _watch_cache.get(call_key)
+    if got and got[0] == h:
+        return got[1] or None
+    if got:  # ワークスペースが変わった (電話帳の追記など) — 作り直す
+        _drop_watch_cache(call_key)
+    try:
+        c = _gemini_rest("POST", "cachedContents", {
+            "model": f"models/{GEMINI_MODEL}",
+            "systemInstruction": {"parts": [{"text": WATCHER_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": prefix}]}],
+            "ttl": WATCH_CACHE_TTL,
+        })
+    except Exception as e:
+        log.info("watch cache: 作れないので全部送る (%s)", str(e)[:120])
+        _watch_cache[call_key] = (h, "")
+        return None
+    name = c.get("name") or ""
+    _watch_cache[call_key] = (h, name)
+    log.info("watch cache: %s (%s tokens)", name, (c.get("usageMetadata") or {}).get("totalTokenCount"))
+    return name or None
+
+
+def _drop_watch_cache(call_key: str) -> None:
+    got = _watch_cache.pop(call_key, None)
+    if got and got[1]:
+        try:
+            _gemini_rest("DELETE", got[1])
+        except Exception:
+            pass  # TTL で消える
+
+
+def drop_ended_watch_caches(active: set[str]) -> None:
+    for k in [k for k in _watch_cache if k not in active]:
+        _drop_watch_cache(k)
+
+
 def make_watch_output(
-    convo: str, caller: str | None, notes: list[str], frags: list[tuple[str, str, str]]
+    convo: str,
+    caller: str | None,
+    notes: list[str],
+    frags: list[tuple[str, str, str]],
+    lookup: str = "",
+    identity: str = "",
+    call_key: str = "",
 ) -> str:
     ctx = gather_workspace()
     notes_block = "\n".join(f"- {s}" for s in notes) if notes else "(なし)"
@@ -446,14 +736,26 @@ def make_watch_output(
         if frags
         else "(なし)"
     )
-    user = (
+    prefix = (
+        f"# この電話について (管制室の設定)\n{identity or '(不明)'}\n\n"
         f"# ワークスペースの内容\n{ctx}\n\n"
+    )
+    rest = (
         f"# すでに電話AIへ送ったメモ\n{notes_block}\n\n"
         f"# 現在表示中の吹き出し (続投するものは一字一句同じで再掲)\n{frags_block}\n\n"
+        f"# 番号のweb検索結果\n{lookup or '(なし)'}\n\n"
         f"# 進行中の通話の文字起こし (相手番号: {caller or '不明'})\n{convo}\n\n"
         "指定のJSON形式で出力。"
     )
-    return call_gemini(WATCHER_PROMPT, user, json_mode=True)
+    cache = _watch_cache_for(call_key, prefix) if call_key else None
+    if cache:
+        try:
+            return call_gemini(WATCHER_PROMPT, rest, json_mode=True, cached=cache)
+        except urllib.error.HTTPError as e:
+            # キャッシュが消えていた等。次の発話で作り直す
+            log.info("watch cache: 使えなかった (%s) — 全部送る", e.code)
+            _watch_cache.pop(call_key, None)
+    return call_gemini(WATCHER_PROMPT, prefix + rest, json_mode=True)
 
 
 def urgent_allowed(number: str) -> bool:
@@ -506,6 +808,10 @@ async def watch_conversations(pool: asyncpg.Pool) -> None:
         "SELECT id, caller_number, room_name, answered_by FROM calls "
         "WHERE ended_at IS NULL AND started_at > now() - interval '2 hours'"
     )
+    if _watch_cache:  # 終わった通話の明示キャッシュを消す (保存料がかかるので TTL まで待たない)
+        await asyncio.get_running_loop().run_in_executor(
+            None, drop_ended_watch_caches, {str(c["id"]) for c in calls}
+        )
     for c in calls:
         cid = str(c["id"])
         if cid not in _watch_seen:
@@ -566,6 +872,9 @@ async def watch_conversations(pool: asyncpg.Pool) -> None:
                 c["caller_number"],
                 notes,
                 [(r["kind"], r["title"], r["text"]) for r in current_rows],
+                _lookup_text(c["caller_number"] or ""),
+                await line_identity(pool),
+                cid,
             )
             data = parse_json_object(raw)
         except Exception:
@@ -655,7 +964,7 @@ async def export_transcripts(pool: asyncpg.Pool) -> None:
     rec_dir = WORKSPACE / "通話記録"
     rec_dir.mkdir(parents=True, exist_ok=True)
     calls = await pool.fetch(
-        "SELECT id, room_name, caller_number, started_at, ended_at FROM calls "
+        "SELECT id, room_name, caller_number, started_at, ended_at, recording_path FROM calls "
         "WHERE ended_at IS NOT NULL ORDER BY started_at DESC LIMIT 50"
     )
     existing = {p.stem.rsplit("_", 1)[-1] for p in rec_dir.glob("*.md")}
@@ -685,6 +994,8 @@ async def export_transcripts(pool: asyncpg.Pool) -> None:
             f"# 通話記録 {started:%Y-%m-%d %H:%M} ({caller})",
             "",
         ]
+        if c["recording_path"]:
+            lines += [recordings.embed_line(c["recording_path"]), ""]
         for s in segs:
             label = SPEAKER_LABEL.get(s["speaker"], s["speaker"])
             lines.append(f"- **{label}**: {s['text']}")
@@ -698,54 +1009,108 @@ async def export_transcripts(pool: asyncpg.Pool) -> None:
         #   判定はルーム名 — シミュレータは `call_<番号>_sim<連番>` を使うので当て推量が要らない
         if c["room_name"].rsplit("_", 1)[-1].startswith("sim"):
             continue
-        pb = phonebook_path(caller)
-        if pb and not pb.exists():
-            pb.parent.mkdir(parents=True, exist_ok=True)
-            pb.write_text(PHONEBOOK_TEMPLATE.format(number=caller), encoding="utf-8")
-            log.info("phonebook created: %s", pb.name)
+        if pb.is_number(caller) and BOOK.file(caller) is None:
+            BOOK.ensure(caller)
+            log.info("phonebook created: %s", caller)
 
 
-CALL_SUMMARY_PROMPT = """電話応対AIが受けた通話の文字起こしを読み、終話後に本人 ({OWNER}) のスマホへ出す
-通知の本文を作ります。読者は{OWNER}本人です。
+CALL_SUMMARY_PROMPT = """電話の文字起こしを読み、終話後に本人 ({OWNER}) のスマホの通知と通話履歴に出す
+要約を作ります。読者は{OWNER}本人です。応対したのは AI のことも本人のこともあります。
 - 1〜2文、60字程度まで。「誰が・何の用で・折り返しが要るか (期限があれば)」を先に
 - 相手が名乗っていなければ「名乗らず」と書く。相手が何も言わずに切れたら「無言のまま切れた」
+- caller_org: 相手が名乗った会社・団体名 (例「山田建設」)。言っていなければ空文字
+- caller_person: 相手が名乗った個人の名前 (例「山田」「山田太郎」)。言っていなければ空文字。
+  AI や本人の名前は入れない
+- lookup_conflict: 「番号検索の結果」が付いていて、通話で分かった相手の正体 (名乗った会社・団体・
+  立場) がそれと食い違うときだけ、「番号検索では〇〇、通話では△△と名乗った」の形で書く。
+  食い違わない・判断できないときは空文字。個人名が加わっただけ (テナント → テナントの山田) は食い違いではない
 - 挨拶・お礼・AIの受け答えの説明は書かない
-出力JSON: {"summary": "..."}"""
+出力JSON: {"summary": "...", "caller_org": "...", "caller_person": "...", "lookup_conflict": "..."}"""
 
 
 async def summarize_ended_calls(pool: asyncpg.Pool) -> None:
-    """終話したAI応対の通話に要約を付ける (calls.summary_md)。端末の終話通知の本文になる (2026-09-25)。
+    """終話した通話に要約を付ける (calls.summary_md)。AI 応対の着信は終話通知の本文、
+    どの通話もアプリの履歴で展開したときの本文になる (2026-09-25、履歴は 2026-09-26)。
 
-    ⚠対象は AI が応対して終わった着信だけ。本人が話した通話 (human / ai_then_human) は
-      中身を本人が知っているので通知しない = 要約も作らない。
-    ⚠直近1時間に終わったものだけ。過去の通話を遡って要約しない (通知もしないので要らない)。
+    ⚠先に直近1時間の AI 応対の着信 (終話通知を待っている) を片付ける。それ以外 (本人が話した通話・
+      発信・過去の通話) は、通話中でないときに 1 回 1 本だけ遡る。会話の見張りと同じループなので、
+      通話中に遡ると見張りが遅れる。
+      ⚠通知を出すかは端末の状態 API が answered_by と終話時刻で絞っているので、ここで要約を
+      作っても本人が話した通話や過去の通話の通知は出ない
     ⚠失敗や発話なしでも空文字を入れて打ち切る — NULL のままだと毎秒やり直す"""
     c = await pool.fetchrow(
-        """SELECT id, caller_number FROM calls
+        """SELECT id, caller_number, room_name, started_at, ended_at FROM calls
            WHERE ended_at IS NOT NULL AND summary_md IS NULL
              AND direction = 'inbound' AND answered_by = 'ai'
              AND ended_at > now() - interval '1 hour'
            ORDER BY ended_at LIMIT 1"""
     )
     if not c:
+        c = await pool.fetchrow(
+            """SELECT id, caller_number, room_name, started_at, ended_at FROM calls
+               WHERE ended_at IS NOT NULL AND summary_md IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM calls WHERE ended_at IS NULL)
+               ORDER BY ended_at DESC LIMIT 1"""
+        )
+    if not c:
         return
+    summary, org, person, conflict = await summarize_call(pool, c)
+    await pool.execute("UPDATE calls SET summary_md=$2 WHERE id=$1", c["id"], summary)
+    log.info("call summary %s: %s", c["id"], summary[:80])
+    try:
+        update_phonebook_after_call(c, summary, org, person, conflict)
+    except Exception:
+        log.exception("phonebook update failed: %s", c["id"])
+    label = caller_label(c["caller_number"] or "", org, person)
+    if label:
+        await pool.execute("UPDATE calls SET caller_label=$2 WHERE id=$1", c["id"], label)
+
+
+def caller_label(number: str, org: str, person: str) -> str | None:
+    """通話ごとの相手の呼び名 (calls.caller_label、2026-09-26)。電話帳の名前 (番号の持ち主) で足りるときは None。
+    - 話した個人がいて、持ち主と別人 → 「山田太郎」
+    - その人が電話帳と違う組織を名乗った → 「南山テスト建設 佐藤」
+    - 個人は名乗らず、電話帳と違う組織を名乗った → 「南山テスト建設」
+    ⚠電話帳の更新 (update_phonebook_after_call) の後に呼ぶ — 持ち主の名前が決まってから比べる"""
+    p = phonebook_path(number)
+    owner = pb.name_state(p.read_text(encoding="utf-8"))[0] if p else ""
+    owner = "" if owner == "不明" else owner
+    other_org = org if org and not pb.same_org(org, owner) else ""
+    if person and pb.norm_person(person) != pb.norm_person(owner):
+        return f"{other_org} {person}".strip()[:60]
+    return other_org[:60] or None
+
+
+async def summarize_call(pool: asyncpg.Pool, c) -> tuple[str, str, str, str]:
+    """通話 1 本の (要約, 名乗った組織, 名乗った個人, 番号検索との食い違い)。
+    ⚠infra/scripts/try_phonebook_update.py (テスト通話で電話帳の更新を試す外部の道具) からも呼ぶ"""
     segs = await pool.fetch(
         "SELECT speaker, text FROM transcript_segments WHERE call_id=$1 ORDER BY id", c["id"]
     )
     summary = ""
+    org = ""
+    person = ""
+    conflict = ""
     if not any(s["speaker"] == "caller" and s["text"].strip() for s in segs):
         summary = "無言のまま切れた"
     else:
         convo = "\n".join(f"{SPEAKER_LABEL.get(s['speaker'], s['speaker'])}: {s['text']}" for s in segs)
         try:
             out = await asyncio.get_running_loop().run_in_executor(
-                None, call_gemini, CALL_SUMMARY_PROMPT, f"# 発信者番号\n{c['caller_number']}\n\n# 文字起こし\n{convo}", True
+                None, call_gemini, CALL_SUMMARY_PROMPT,
+                f"# 発信者番号\n{c['caller_number']}\n\n"
+                f"# 番号検索の結果\n{_lookup_text(c['caller_number'] or '') or '(なし)'}\n\n"
+                f"# 文字起こし\n{convo}",
+                True
             )
-            summary = str(json.loads(out).get("summary") or "").strip()[:200]
+            j = json.loads(out)
+            summary = str(j.get("summary") or "").strip()[:200]
+            org = str(j.get("caller_org") or "").strip()[:40]
+            person = str(j.get("caller_person") or "").strip()[:40]
+            conflict = str(j.get("lookup_conflict") or "").strip()[:120]
         except Exception:
             log.exception("call summary failed: %s", c["id"])
-    await pool.execute("UPDATE calls SET summary_md=$2 WHERE id=$1", c["id"], summary)
-    log.info("call summary %s: %s", c["id"], summary[:80])
+    return summary, org, person, conflict
 
 
 async def run_lookup(pool: asyncpg.Pool, job_id: int, number: str) -> None:
@@ -808,10 +1173,22 @@ async def main() -> None:
             await watch_conversations(pool)  # 会話監視 (相手の新発話があった時だけLLM)
             if tick % 30 == 0:  # 30秒ごと
                 await export_transcripts(pool)
+                await recordings.import_raw(pool, WORKSPACE)
+            if tick % 3600 == 600:  # 1時間ごと (起動直後は避ける)
+                await recordings.apply_retention(pool, WORKSPACE)
+                await recordings.forget_missing(pool, WORKSPACE)
+                await refresh_lookup_names(pool)
+                await asyncio.get_running_loop().run_in_executor(None, fill_phonebook_names)
+                await asyncio.get_running_loop().run_in_executor(None, fill_phonebook_kana)
         except Exception:
             log.exception("loop error (継続)")
         tick += 1
         await asyncio.sleep(1)
+
+
+for _n in ("WATCHER_PROMPT", "LOOKUP_PROMPT", "DIGEST_PROMPT", "KANA_PROMPT", "CALL_SUMMARY_PROMPT"):
+    if _n in globals():
+        _PROMPT_TAGS[globals()[_n]] = _n.removesuffix("_PROMPT").lower()
 
 
 if __name__ == "__main__":

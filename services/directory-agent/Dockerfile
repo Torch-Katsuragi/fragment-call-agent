@@ -5,6 +5,8 @@
 FROM python:3.12-slim
 WORKDIR /app
 RUN pip install --no-cache-dir asyncpg
-COPY worker.py .
+# 録音を Ogg Opus にする (2026-10-02、recordings.py)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+COPY *.py ./
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "worker.py"]

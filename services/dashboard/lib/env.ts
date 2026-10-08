@@ -39,7 +39,22 @@ export type LineInfo = {
   configured: boolean;
 };
 
-export const LINES: LineInfo[] = [
+// ⚠main 以外のテナント (2026-10-04、同居構成) はユーザー本人の回線を見せない。そのテナントの回線だけ
+//   (systemd のユニットで TENANT_LINE_NUMBER / TENANT_LINE_LABEL を渡す)
+const OTHER_TENANT = (process.env.TENANT_ID || "main") !== "main";
+
+export const LINES: LineInfo[] = OTHER_TENANT
+  ? [
+      {
+        id: "tenant",
+        label: process.env.TENANT_LINE_LABEL ?? "Twilio",
+        number: process.env.TENANT_LINE_NUMBER ?? "",
+        kind: "peer型 (非REGISTER)",
+        role: "代表番号 (受電・発信)",
+        configured: !!process.env.TENANT_LINE_NUMBER,
+      },
+    ]
+  : [
   {
     id: "brastel",
     label: "ブラステル My050",

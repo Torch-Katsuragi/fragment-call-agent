@@ -40,7 +40,8 @@ import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.Hearing
 import androidx.compose.material.icons.rounded.Lightbulb
 import androidx.compose.material.icons.rounded.Mic
-import androidx.compose.material.icons.rounded.MicOff
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.SmartToy
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
@@ -89,7 +90,10 @@ import kotlinx.coroutines.withContext
  * 通話画面。進行中なら会話・フラグメント・耳打ち・操作、終わった通話なら記録として読む。
  *
  * ⚠この画面を開いている間は**必ず音を出す** (2026-09-18 ユーザー「その画面を開いてたら確定で流す」)。
- *   閉じたら離す (応対中は離しても繋がったまま — CallAudio が operator を持っている)
+ *   閉じたら離す (会話中は離しても繋がったまま — CallAudio が operator を持っている)
+ * ⚠端末の状態は 3 つ (2026-09-26、services/agent/presence.py): 待機 (この画面の外) / 視聴 (この画面を
+ *   開いている) / 会話 (マイクもスピーカーもオン、固定)。黙りたいときは視聴に下りる — ミュートは無い。
+ *   会話中の端末が無く AI 応答もオフなら保留 (AI が保留音を流す)。保留中はここから相手を指定して呼べる
  */
 @Composable
 fun CallScreen(prefs: Prefs, callId: String, onBack: () -> Unit, onRedial: (String) -> Unit) {
@@ -128,8 +132,13 @@ fun CallScreen(prefs: Prefs, callId: String, onBack: () -> Unit, onRedial: (Stri
     val levels by CallAudio.levels.collectAsState()
     val mine = c != null && audio.room == c.room
     val operator = mine && audio.operator
+    // 担い手と参加者。⚠待機用のロングポーリング (ServerState) の方が詳細のポーリング (1.5 秒) より速い
+    val live by ServerState.activeCall.collectAsState()
+    val handler = live?.takeIf { it.id == callId }?.handler ?: c?.handler.orEmpty()
+    val presence = live?.takeIf { it.id == callId }?.presence ?: c?.presence.orEmpty()
 
     var confirmHangup by remember { mutableStateOf(false) }
+    var calloutOpen by remember { mutableStateOf(false) }
 
     Column(
         Modifier
@@ -150,7 +159,7 @@ fun CallScreen(prefs: Prefs, callId: String, onBack: () -> Unit, onRedial: (Stri
         }
 
         if (active) {
-            StatusStrip(operator, audio, levels.me)
+            StatusStrip(operator, handler, presence, prefs.deviceId, audio, levels.me)
         }
         if (c.fragments.isNotEmpty()) {
             FragmentsRow(c.fragments)
@@ -158,10 +167,12 @@ fun CallScreen(prefs: Prefs, callId: String, onBack: () -> Unit, onRedial: (Stri
         Transcript(
             segments = c.segments,
             pendingWhispers = pendingWhispers,
-            interim = if (mine) interim else emptyList(),
+            // AI が担い手でない間の AI の途中表示は出さない (声は出ていない。モデルが裏で考えているだけ)
+            interim = if (mine) interim.filter { it.speaker != "ai" || handler == "ai" } else emptyList(),
             modifier = Modifier.weight(1f),
         )
-        if (active) {
+        // 耳打ちは AI への指示なので、AI が応対している間だけ
+        if (active && handler == "ai") {
             WhisperBar { text ->
                 pendingWhispers += text
                 scope.launch {
@@ -172,10 +183,27 @@ fun CallScreen(prefs: Prefs, callId: String, onBack: () -> Unit, onRedial: (Stri
                     }
                 }
             }
+        }
+        if (active) {
             Controls(
                 operator = operator,
+                handler = handler,
                 audio = audio,
-                onToggleOperator = { CallAudio.setOperator(ctx, c.room, !operator) },
+                onTalk = { CallCoordinator.setTalking(ctx, c.room, true) },
+                // 保留 = 会話から抜けて視聴に下りる。AI 応答は本人が入った時点でオフなので、そのまま保留になる
+                onHold = { CallCoordinator.setTalking(ctx, c.room, false) },
+                onToAi = {
+                    scope.launch {
+                        // ⚠先に AI 応答をオンにしてから抜ける。逆だと一瞬保留音が鳴る
+                        val ok = withContext(Dispatchers.IO) { api.setAi(callId, true) }
+                        if (!ok) {
+                            Toast.makeText(ctx, "AIに切り替えられませんでした", Toast.LENGTH_SHORT).show()
+                            return@launch
+                        }
+                        if (operator) CallCoordinator.setTalking(ctx, c.room, false)
+                    }
+                },
+                onCallout = { calloutOpen = true },
                 onHangup = { confirmHangup = true },
             )
         } else if (c.number != null) {
@@ -187,6 +215,10 @@ fun CallScreen(prefs: Prefs, callId: String, onBack: () -> Unit, onRedial: (Stri
                 }
             }
         }
+    }
+
+    if (calloutOpen && c != null) {
+        CalloutDialog(api, callId, onDismiss = { calloutOpen = false })
     }
 
     if (confirmHangup) {
@@ -248,7 +280,12 @@ private fun TopBar(c: FragmentApi.Call?, active: Boolean, onBack: () -> Unit, on
                         color = subColor,
                     )
                 }
-                if (c.name != null && c.number != null) {
+                // この通話の相手の呼び名を見出しにしたときは、電話帳の名前を小さく添える
+                val reg = c.registeredName?.takeIf { c.callerLabel != null }
+                if (reg != null) {
+                    Text(" · $reg", style = sub, color = subColor, maxLines = 1)
+                }
+                if ((c.name != null || c.callerLabel != null) && c.number != null) {
                     Text(" · ${c.number}", style = sub, color = subColor, maxLines = 1)
                 }
             }
@@ -256,16 +293,45 @@ private fun TopBar(c: FragmentApi.Call?, active: Boolean, onBack: () -> Unit, on
     }
 }
 
-/** 誰が話しているか・音の出どころ */
+/** 誰が話しているか (担い手と参加者)・音の出どころ */
 @Composable
-private fun StatusStrip(operator: Boolean, audio: CallAudio.State, myLevel: Float) {
+private fun StatusStrip(
+    operator: Boolean,
+    handler: String,
+    presence: List<FragmentApi.Presence>,
+    myId: String,
+    audio: CallAudio.State,
+    myLevel: Float,
+) {
+    val others = presence.filter { it.id != myId }
+    val otherTalkers = others.filter { it.role == "talk" }.map { it.name.ifEmpty { "端末" } }
+    val watchers = others.filter { it.role == "watch" }.map { it.name.ifEmpty { "端末" } }
+    val label = when {
+        operator && otherTalkers.isNotEmpty() -> "あなたと${otherTalkers.joinToString("・")}が会話中"
+        operator -> "あなたが会話中"
+        handler == "human" -> "${otherTalkers.joinToString("・").ifEmpty { "本人" }}が応対中"
+        handler == "hold" -> "保留中"
+        handler == "connecting" -> "接続中"
+        else -> "AIが応対中"
+    }
     Row(
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        HandlerPill(operator)
+        HandlerPill(operator, label, hold = handler == "hold" && !operator)
+        if (watchers.isNotEmpty()) {
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "視聴: ${watchers.joinToString("・")}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+        }
         if (operator) {
             Spacer(Modifier.width(8.dp))
             // 自分の声を拾えていれば光る (マイクの確認)
@@ -273,14 +339,13 @@ private fun StatusStrip(operator: Boolean, audio: CallAudio.State, myLevel: Floa
                 Modifier
                     .size(8.dp)
                     .clip(CircleShape)
-                    .background(if (myLevel > 0.04f && !audio.muted) LocalSemantic.current.me else MaterialTheme.colorScheme.outlineVariant)
+                    .background(if (myLevel > 0.04f) LocalSemantic.current.me else MaterialTheme.colorScheme.outlineVariant)
             )
         }
         Spacer(Modifier.weight(1f))
         val note = when {
             audio.error != null -> audio.error
             !audio.connected -> "音声に接続中…"
-            audio.muted -> "ミュート中"
             else -> null
         }
         if (note != null) {
@@ -504,32 +569,42 @@ private fun WhisperBar(onSend: (String) -> Unit) {
     }
 }
 
-/** 下の操作列: ミュート / 出力先 / 自分が出る⇔AIに任せる / 終了 */
+/**
+ * 下の操作列 (2026-09-26 に 3 状態へ組み替え):
+ *   会話中   … 出力先 / 保留 / AIに任せる / 終了
+ *   保留中   … 呼ぶ / 話す / AIに任せる / 終了
+ *   それ以外 … 出力先 / 話す / 終了
+ */
 @Composable
 private fun Controls(
     operator: Boolean,
+    handler: String,
     audio: CallAudio.State,
-    onToggleOperator: () -> Unit,
+    onTalk: () -> Unit,
+    onHold: () -> Unit,
+    onToAi: () -> Unit,
+    onCallout: () -> Unit,
     onHangup: () -> Unit,
 ) {
     val sem = LocalSemantic.current
     val s = MaterialTheme.colorScheme
     var routeMenu by remember { mutableStateOf(false) }
+    val holding = handler == "hold" && !operator
     Row(
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 14.dp),
         horizontalArrangement = Arrangement.SpaceEvenly,
     ) {
-        ControlButton(
-            label = if (audio.muted) "ミュート中" else "ミュート",
-            icon = if (audio.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
-            container = if (audio.muted) s.onSurface else s.surfaceContainerHigh,
-            content = if (audio.muted) s.surface else s.onSurface,
-            enabled = operator && audio.connected,
-            onClick = { CallAudio.setMuted(!audio.muted) },
-        )
-        Box {
+        if (holding) {
+            ControlButton(
+                label = "呼ぶ",
+                icon = Icons.Rounded.PersonAdd,
+                container = s.surfaceContainerHigh,
+                content = s.onSurface,
+                onClick = onCallout,
+            )
+        } else Box {
             val route = audio.route
             ControlButton(
                 label = routeLabel(route),
@@ -562,13 +637,32 @@ private fun Controls(
                 }
             }
         }
-        ControlButton(
-            label = if (operator) "AIに任せる" else "自分が出る",
-            icon = if (operator) Icons.Rounded.SmartToy else Icons.Rounded.Mic,
-            container = if (operator) s.surfaceContainerHigh else sem.me,
-            content = if (operator) s.onSurface else Color.White,
-            onClick = onToggleOperator,
-        )
+        if (operator) {
+            ControlButton(
+                label = "保留",
+                icon = Icons.Rounded.Pause,
+                container = s.surfaceContainerHigh,
+                content = s.onSurface,
+                onClick = onHold,
+            )
+        } else {
+            ControlButton(
+                label = "話す",
+                icon = Icons.Rounded.Mic,
+                container = sem.me,
+                content = Color.White,
+                onClick = onTalk,
+            )
+        }
+        if (operator || holding) {
+            ControlButton(
+                label = "AIに任せる",
+                icon = Icons.Rounded.SmartToy,
+                container = s.surfaceContainerHigh,
+                content = s.onSurface,
+                onClick = onToAi,
+            )
+        }
         ControlButton(
             label = "終了",
             icon = Icons.Rounded.CallEnd,
@@ -631,6 +725,77 @@ private fun ControlButton(
 }
 
 /**
+ * 保留中に呼ぶ相手を選ぶ (2026-09-26)。候補は端末の持ち主で、AI が会話の流れから並べ替えてある
+ * (役割と用件が結びつく人には理由が付く)。選ぶとその端末で取り次ぎと同じ呼び出しが鳴り、
+ * 出れば会話に入る = 保留が解ける
+ */
+@Composable
+private fun CalloutDialog(api: FragmentApi, callId: String, onDismiss: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var list by remember { mutableStateOf<List<FragmentApi.Candidate>?>(null) }
+    var failed by remember { mutableStateOf(false) }
+    LaunchedEffect(callId) {
+        val r = withContext(Dispatchers.IO) { api.candidates(callId) }
+        if (r == null) failed = true else list = r
+    }
+    fun call(targets: List<String>, who: String) {
+        onDismiss()
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { api.callout(callId, targets) }
+            Toast.makeText(ctx, if (ok) "${who}を呼んでいます" else "呼び出せませんでした", Toast.LENGTH_SHORT).show()
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("誰を呼びますか") },
+        text = {
+            val l = list
+            when {
+                failed -> Text("候補を読み込めませんでした")
+                l == null -> Text("候補を並べています…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                l.isEmpty() -> Text("呼べる端末がありません。ほかの端末でアプリの名前を設定してください")
+                else -> LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                    items(l, key = { it.id }) { cand ->
+                        Surface(
+                            onClick = { call(listOf(cand.id), cand.name) },
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color.Transparent,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(Modifier.padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Avatar(cand.name, size = 36.dp)
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(cand.name, style = MaterialTheme.typography.titleSmall)
+                                    val sub = cand.reason.ifEmpty { cand.role }
+                                    if (sub.isNotEmpty()) {
+                                        Text(
+                                            sub,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = if (cand.reason.isNotEmpty()) MaterialTheme.colorScheme.primary
+                                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (!list.isNullOrEmpty()) {
+                TextButton(onClick = { call(emptyList(), "全員") }) { Text("全員を呼ぶ") }
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("やめる") } },
+    )
+}
+
+/**
  * 応答したが、通話の id がまだ分からない間の画面。
  * ⚠着信 (CALL) に出たときはルームすら無い — 受話 → ダイヤルプランがブリッジ → agent が通話行を作る、
  *   まで数秒かかる。**どの通話でもよいから**通話が現れたらそれに operator で入る (2026-09-19 の注記)
@@ -644,7 +809,7 @@ fun JoiningScreen(prefs: Prefs, room: String?, onJoined: (String) -> Unit, onGiv
         repeat(40) {
             val a = withContext(Dispatchers.IO) { api.deviceState()?.activeCall }
             if (a != null && (room == null || a.room == room)) {
-                CallAudio.setOperator(ctx, a.room, true)
+                CallCoordinator.setTalking(ctx, a.room, true)
                 onJoined(a.id)
                 return@LaunchedEffect
             }

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { deviceFrom } from "@/lib/device";
 
 export const dynamic = "force-dynamic";
 
@@ -17,7 +18,9 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: false, error: "room is required" }, { status: 400 });
   }
   try {
-    const res = await fetch(`${HOOKD}/handoff_decline?room=${encodeURIComponent(room)}`, {
+    // ⚠端末を名乗る。保留中に人が呼んだ呼び出しは、断った端末だけ鳴り止む (hookd)
+    const q = new URLSearchParams({ room, device: deviceFrom(req)?.id ?? "" });
+    const res = await fetch(`${HOOKD}/handoff_decline?${q}`, {
       cache: "no-store",
     });
     if (!res.ok) {

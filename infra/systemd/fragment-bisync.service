@@ -1,0 +1,22 @@
+[Unit]
+Description=Fragment workspace bisync (Google Drive <-> VM)
+# フラグメントワークスペースの双方向同期 (2026-08-01 導入)。
+# 設計: Google Drive が唯一の正。VM はこのタイマーで5分毎に追従する。
+# ⚠録音 (録音/) はこちらから外し、fragment-rec-bisync で別に同期する (2026-10-02)。
+#   録音は管制室から期間を指定してまとめて消すので、ここの --max-delete に当たって
+#   ワークスペース全体の同期が止まる (2026-08 に電話帳の掃除で 1.5 か月止めた) のを避ける。
+#   フィルタを変えたら一度 --resync が要る (rclone bisync の仕様)
+# ⚠同期が壊れて "--resync required" が出たら:
+#   sudo -u fragment rclone bisync 'gdrive:fragment' \
+#     '/srv/fragment/workspace' --filters-file /home/fragment/.config/rclone/fragment-main.filter --resync
+# 正本はリポジトリの infra/systemd/ (VM の /etc/systemd/system/ へ置く)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=fragment
+# --max-delete 20: 片側の大量消失(マウント外れ等)を全削除として同期する事故のガード
+# --conflict-resolve newer: 両側で編集された場合は新しい方を採用
+# --resilient --recover: 一時エラーから自動復帰し、resync要求になりにくくする
+ExecStart=/usr/bin/rclone bisync "gdrive:fragment" "/srv/fragment/workspace" --filters-file /home/fragment/.config/rclone/fragment-main.filter --max-delete 20 --conflict-resolve newer --resilient --recover --max-lock 2m

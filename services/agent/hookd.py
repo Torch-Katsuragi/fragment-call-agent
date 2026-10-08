@@ -21,7 +21,10 @@ import asyncpg
 from aiohttp import web
 from livekit import api as lk_api
 
+import members
+import presence
 import push
+import schedule
 import security
 
 DSN = os.environ["DATABASE_URL"]
@@ -92,23 +95,35 @@ async def prefetch(req: web.Request) -> web.Response:
 async def _answer_mode(pool: asyncpg.Pool) -> str:
     """応答モード away / standby / manual (2026-08-01に2状態から3状態化)。
 
-    ⚠正は settings.answer_mode。未設定のときだけ旧 assistant_enabled から導出する。
-      移行期の後方互換であって二重管理ではない — 管制室から書くときは
-      answer_mode と assistant_enabled の両方を更新する (dashboard の /api/settings)。
+    2026-09-29 から時間割と手動の上書きを見る (schedule.py)。⚠判定はここだけ —
+    管制室とアプリは /answer_mode_info を見る。settings.answer_mode を直に読まないこと
+    (手動の値であって、時間割が効いているいまのモードとは限らない)。
     """
-    row = await pool.fetchrow("SELECT value FROM settings WHERE key = 'answer_mode'")
-    if row and row["value"] in ("away", "standby", "manual"):
-        return row["value"]
-    row = await pool.fetchrow(
-        "SELECT value FROM settings WHERE key = 'assistant_enabled'"
-    )
-    return "manual" if (row and row["value"] == "false") else "away"
+    return await schedule.effective_mode(pool)
+
+
+async def answer_mode_info(req: web.Request) -> web.Response:
+    """いまの応答モードと出どころ・次の切り替わり (管制室・アプリの表示用)。"""
+    return web.json_response(await schedule.info(req.app["pool"]))
+
+
+async def answer_mode_set(req: web.Request) -> web.Response:
+    """手で応答モードを切り替える。時間割が有効なら次の切り替わりまで (schedule.set_manual)。"""
+    mode = req.query.get("mode", "")
+    if mode not in schedule.MODES:
+        return web.json_response({"ok": False, "error": "bad mode"}, status=400)
+    got = await schedule.set_manual(req.app["pool"], mode)
+    log.info("answer mode set by hand: %s (%s)", mode, got)
+    return web.json_response({"ok": True, **got})
 
 
 async def answer_mode(req: web.Request) -> web.Response:
     """ダイヤルプランが分岐に使う応答モード。プレーンテキスト。
-    hookd停止時はCURLが空を返し、ダイヤルプラン側は away 扱い (fail-open = 従来どおりAIが出る)。"""
-    return web.Response(text=await _answer_mode(req.app["pool"]))
+    hookd停止時はCURLが空を返し、ダイヤルプラン側は away 扱い (fail-open = 従来どおりAIが出る)。
+    number を渡すと相手ごとの応答 (電話帳の `応答:`) も見る。人が出る相手は priority を返す
+    (ダイヤルプランはスタンバイの経路を PRIORITY_RING_SEC だけ鳴らす)"""
+    mode, ring = await schedule.call_plan(req.app["pool"], req.query.get("number", ""))
+    return web.Response(text="priority" if ring is not None and mode == "standby" else mode)
 
 
 async def assistant(req: web.Request) -> web.Response:
@@ -145,12 +160,15 @@ def _phase(st: dict) -> str:
 async def ringing_start(req: web.Request) -> web.Response:
     number = req.query.get("number", "")
     if re.fullmatch(r"[+0-9]{4,20}", number):
-        mode = await _answer_mode(req.app["pool"])
+        # 相手ごとの応答 (2026-09-30)。⚠/answer_mode と同じ判定 (schedule.call_plan) を使うこと
+        mode, ring = await schedule.call_plan(req.app["pool"], number)
+        ring_sec = ring if ring is not None else _RING_SEC.get(mode, 0.0)
         now = time.time()
-        # 端末が全部一時停止しているか (2026-09-24)。⚠端末の登録が 1 つも無い構成 (PC だけ) は
-        #   対象外 — 従来どおり待つ。管制室の着信バナーから取る余地を残すため
-        total, active = await push.listeners(req.app["pool"])
-        no_listener = total > 0 and active == 0
+        # 出られる端末がいるか (2026-09-24 一時停止、2026-09-29 人ごとの受付時間)。
+        # ⚠端末の登録が 1 つも無い構成 (PC だけ) は対象外 — 従来どおり待つ。
+        #   管制室の着信バナーから取る余地を残すため
+        total, ring, quiet = await schedule.ring_devices(req.app["pool"])
+        no_listener = total > 0 and not ring
         RINGING[number] = {
             "since": now,
             "pickup": False,
@@ -158,18 +176,21 @@ async def ringing_start(req: web.Request) -> web.Response:
             # 端末 (アプリ) がこの時刻まで鳴らす。過ぎたら鳴り止ませる —
             # ダイヤルプランは既に先へ進んでいるので、鳴らし続けても取れない。
             # ⚠告知中は仮の値。/ringing_phase で ringing になった時点から数え直す
-            "ring_until": now + (ANNOUNCE_MAX_SEC + _RING_SEC[mode] if _RING_SEC.get(mode) else 0.0),
+            "ring_until": now + (ANNOUNCE_MAX_SEC + ring_sec if ring_sec else 0.0),
+            "ring_sec": ring_sec,
             "event": asyncio.Event(),
             "no_listener": no_listener,
+            # 受付時間外の人の端末。着信を見せない (ringing_state?device=)
+            "quiet": quiet,
             "phase": "announcing",
         }
         if no_listener:
-            log.info("ringing: %s — 端末が全部一時停止中 (%d台)", number, total)
+            log.info("ringing: %s — 出られる端末が無い (一時停止か受付時間外、%d台)", number, total)
         log.info("ringing: %s (mode=%s)", number, mode)
         # 端末を鳴らすモードのときだけ FCM で起こす (不在は端末が鳴らないので押さない)。
         # ⚠await しない — ダイヤルプランはこの応答を待ってから鳴らし始める
-        if _RING_SEC.get(mode, 0.0) > 0:
-            asyncio.create_task(push.wake(req.app["pool"], "ring"))
+        if ring_sec > 0:
+            asyncio.create_task(push.wake(req.app["pool"], "ring", exclude=quiet))
     return web.Response(text="ok")
 
 
@@ -178,7 +199,7 @@ async def ringing_phase(req: web.Request) -> web.Response:
     st = RINGING.get(req.query.get("number", ""))
     if st:
         st["phase"] = "ringing"
-        st["ring_until"] = time.time() + _RING_SEC.get(st.get("mode", "away"), 0.0)
+        st["ring_until"] = time.time() + st.get("ring_sec", _RING_SEC.get(st.get("mode", "away"), 0.0))
         log.info("ringing: %s — 告知終わり、鳴らし始め", req.query.get("number", ""))
     return web.Response(text="ok")
 
@@ -295,11 +316,15 @@ async def ringing_decide(req: web.Request) -> web.Response:
 
 
 async def ringing_state(req: web.Request) -> web.Response:
-    """管制室が着信バナー表示のためにポーリングする。"""
+    """管制室が着信バナー表示のためにポーリングする。
+    device = 聞いている端末 (アプリ)。受付時間外の人の端末には着信を見せない (2026-09-29)"""
     _prune()
     if not RINGING:
         return web.json_response({"ringing": None})
     number, st = max(RINGING.items(), key=lambda kv: kv[1]["since"])
+    device = req.query.get("device", "")
+    if device and device in st.get("quiet", []):
+        return web.json_response({"ringing": None})
     return web.json_response(
         {
             "ringing": {
@@ -329,6 +354,24 @@ async def handoff_request(req: web.Request) -> web.Response:
     if not room:
         return web.json_response({"ok": False, "error": "room is required"}, status=400)
     existing = HANDOFF.get(room)
+    # 保留中に本人が相手を指定して呼ぶ (2026-09-26、presence.py)。
+    # ⚠AI の取り次ぎと違い、何度でも鳴らし直せる (前の呼び出しが応答済みでも上書きする) —
+    #   呼ぶのは人の判断で、同じ通話の中で A → B → C と回すのが普通なので
+    targets = [t for t in req.query.get("targets", "").split(",") if t]
+    if req.query.get("manual") == "1":
+        HANDOFF[room] = {
+            "since": time.time(),
+            "number": req.query.get("number", ""),
+            "reason": req.query.get("reason", "")[:200],
+            "accepted": False,
+            "manual": True,
+            "by": req.query.get("by", "")[:40],
+            "targets": targets,
+            "declined_by": [],
+        }
+        log.info("manual call-out: %s → %s", room, targets or "全端末")
+        asyncio.create_task(push.wake(req.app["pool"], "handoff", targets or None))
+        return web.json_response({"ok": True, "timeout": HANDOFF_TIMEOUT})
     if (
         existing
         and not existing["accepted"]
@@ -343,14 +386,23 @@ async def handoff_request(req: web.Request) -> web.Response:
     if existing and existing["accepted"]:
         log.info("handoff already accepted — 鳴らし直さない: %s", room)
         return web.json_response({"ok": True, "already_accepted": True})
+    # 受付時間外の人は呼ばない (2026-09-29)。⚠誰もいなければ待たせずに「つかまらない」を返す —
+    #   25 秒無音で待たせてから同じ答えになるだけなので。端末の登録が無い構成 (PC だけ) は従来どおり
+    total, ring, quiet = await schedule.ring_devices(req.app["pool"])
+    nobody = total > 0 and not ring
     HANDOFF[room] = {
         "since": time.time(),
         "number": req.query.get("number", ""),
         "reason": req.query.get("reason", "")[:200],
         "accepted": False,
+        "quiet": quiet,
+        "declined": nobody,
     }
+    if nobody:
+        log.info("handoff requested: %s — 出られる人がいない (一時停止か受付時間外)", room)
+        return web.json_response({"ok": True, "timeout": HANDOFF_TIMEOUT, "nobody": True})
     log.info("handoff requested: %s", room)
-    asyncio.create_task(push.wake(req.app["pool"], "handoff"))
+    asyncio.create_task(push.wake(req.app["pool"], "handoff", exclude=quiet))
     return web.json_response({"ok": True, "timeout": HANDOFF_TIMEOUT})
 
 
@@ -358,11 +410,17 @@ async def handoff_state(req: web.Request) -> web.Response:
     """受け手 (管制室・将来はアプリ) が「今呼ばれているか」を見張る。"""
     _prune()
     now = time.time()
-    # 期限内で未承諾のものだけを「鳴らすべき」として返す
+    device = req.query.get("device", "")
+    # 期限内で未承諾のものだけを「鳴らすべき」として返す。
+    # ⚠宛先を指定した呼び出し (manual) は、宛先の端末と、宛先を知らない呼び手 (管制室) にだけ返す。
+    #   断った端末には返さない (他の宛先はまだ鳴っている)
     live = {
         r: v
         for r, v in HANDOFF.items()
         if not v["accepted"] and not v.get("declined") and now - v["since"] <= HANDOFF_TIMEOUT
+        and (not v.get("targets") or not device or device in v["targets"])
+        and device not in v.get("declined_by", [])
+        and (v.get("manual") or not device or device not in v.get("quiet", []))
     }
     if not live:
         return web.json_response({"handoff": None})
@@ -375,6 +433,9 @@ async def handoff_state(req: web.Request) -> web.Response:
                 "reason": st["reason"],
                 "since": st["since"],
                 "expires_in": HANDOFF_TIMEOUT - (now - st["since"]),
+                # manual = 保留中に人が呼んだ。by = 呼んだ端末の名前
+                "kind": "manual" if st.get("manual") else "ai",
+                "by": st.get("by", ""),
             }
         }
     )
@@ -400,9 +461,38 @@ async def handoff_decline(req: web.Request) -> web.Response:
     st = HANDOFF.get(req.query.get("room", ""))
     if not st:
         return web.json_response({"ok": False, "error": "not ringing"}, status=404)
+    device = req.query.get("device", "")
+    if st.get("manual") and device:
+        # 人が呼んだ呼び出しは、断った端末だけ鳴り止む。宛先が全員断ったら終わり
+        # (保留は続く。保留が長引けば agent が AI に渡す)
+        st["declined_by"].append(device)
+        if st["targets"] and set(st["targets"]) <= set(st["declined_by"]):
+            st["declined"] = True
+        log.info("manual call-out declined by %s: %s", device, req.query.get("room", ""))
+        return web.json_response({"ok": True})
     st["declined"] = True
     log.info("handoff declined: %s", req.query.get("room", ""))
     return web.json_response({"ok": True})
+
+
+async def transfer_candidates(req: web.Request) -> web.Response:
+    """保留中に呼ぶ相手の候補 (2026-09-26)。会話の流れから並べ替えて返す (presence.rank)。
+    exclude = 呼ぶ側の端末 (自分は候補に出さない)"""
+    pool = req.app["pool"]
+    cands = await presence.candidates(pool, req.query.get("exclude", ""))
+    convo: list[tuple[str, str]] = []
+    try:
+        rows = await pool.fetch(
+            """SELECT speaker, text FROM transcript_segments
+               WHERE call_id = (SELECT id FROM calls WHERE room_name = $1)
+                 AND speaker IN ('caller', 'ai', 'user')
+               ORDER BY id DESC LIMIT 20""",
+            req.query.get("room", ""),
+        )
+        convo = [(r["speaker"], r["text"]) for r in reversed(rows)]
+    except Exception:
+        log.exception("候補の並べ替え用の会話が読めない (並べ替えなしで返す)")
+    return web.json_response({"candidates": await presence.rank(cands, convo)})
 
 
 async def handoff_result(req: web.Request) -> web.Response:
@@ -498,14 +588,19 @@ async def _run_sim_call(pool: asyncpg.Pool, scenario: str, number: str = "") -> 
       AIが下調べで名前を知ってしまい**聞かずに「佐藤様ですね」と言えてしまう**。
       テストが実際より甘くなるので、自動テストは毎回違う番号を渡す。"""
     number = number or SIM_NUMBER
-    mode = await _answer_mode(pool)
+    mode, ring_over = await schedule.call_plan(pool, number)
+    ring_sec = ring_over if ring_over is not None else _RING_SEC.get(mode, 0.0)
     now = time.time()
+    total, ring, quiet = await schedule.ring_devices(pool)
     RINGING[number] = {
         "since": now,
         "pickup": False,
         "mode": mode,
-        "ring_until": now + (ANNOUNCE_MAX_SEC + _RING_SEC[mode] if _RING_SEC.get(mode) else 0.0),
+        "ring_until": now + (ANNOUNCE_MAX_SEC + ring_sec if ring_sec else 0.0),
+        "ring_sec": ring_sec,
         "event": asyncio.Event(),
+        "no_listener": total > 0 and not ring,
+        "quiet": quiet,
         "phase": "announcing",
     }
     log.info("sim call: ringing %s (mode=%s)", number, mode)
@@ -513,7 +608,7 @@ async def _run_sim_call(pool: asyncpg.Pool, scenario: str, number: str = "") -> 
     # 録音告知の段を模す (実回線はダイヤルプランが告知を流してから /ringing_phase を叩く)
     await asyncio.sleep(SIM_ANNOUNCE_SEC)
     RINGING[number]["phase"] = "ringing"
-    RINGING[number]["ring_until"] = time.time() + _RING_SEC.get(mode, 0.0)
+    RINGING[number]["ring_until"] = time.time() + ring_sec
 
     try:
         if mode == "manual":
@@ -527,11 +622,13 @@ async def _run_sim_call(pool: asyncpg.Pool, scenario: str, number: str = "") -> 
                 log.info("sim call: 誰も出なかった (不在)")
                 return
         else:
-            if mode == "standby":
+            if mode == "standby" and RINGING[number].get("no_listener"):
+                log.info("sim call: 出られる端末が無い — すぐ AI へ")
+            elif mode == "standby":
                 # ⚠ダイヤルプランと揃えること。スタンバイだけ本人に猶予を与える
                 st = RINGING[number]
                 try:
-                    await asyncio.wait_for(st["event"].wait(), STANDBY_RING_SEC)
+                    await asyncio.wait_for(st["event"].wait(), ring_sec)
                 except asyncio.TimeoutError:
                     st["ring_until"] = 0.0
                 if st["pickup"]:
@@ -546,7 +643,8 @@ async def _run_sim_call(pool: asyncpg.Pool, scenario: str, number: str = "") -> 
             log.info("sim call: 端末で「切る」— 相手ごと切った")
             return
         # ブリッジ = ルーム作成 + caller-sim を明示ディスパッチ (電話アシスタントは自動参加)
-        room = f"call_{number}_sim{int(time.time()) % 1000000}"
+        # 頭はテナントの room_prefix (2026-10-04)。共有の agent はこの頭でテナントを決める
+        room = f"{os.environ.get('ROOM_PREFIX', 'call')}_{number}_sim{int(time.time()) % 1000000}"
         lk = lk_api.LiveKitAPI(
             url=os.environ.get("LIVEKIT_URL", "ws://livekit:7880"),
             api_key=os.environ.get("LIVEKIT_API_KEY", ""),
@@ -657,8 +755,9 @@ async def _ami_originate(number: str) -> tuple[bool, str]:
             {
                 "Action": "Originate",
                 "ActionID": action_id,
-                "Channel": f"PJSIP/{number}@brastel",
-                "Context": "outbound-bridge",
+                # 回線と戻り先はテナントごと (2026-10-04、テナントは自分の Twilio 回線からテナントの番号で出る)
+                "Channel": f"PJSIP/{number}@{os.environ.get('OUTBOUND_TRUNK', 'brastel')}",
+                "Context": os.environ.get("OUTBOUND_CONTEXT", "outbound-bridge"),
                 "Exten": "s",
                 "Priority": "1",
                 "CallerID": f'"{cid}" <{cid}>',
@@ -803,50 +902,9 @@ async def _reaper(app: web.Application) -> None:
         await asyncio.sleep(20)
 
 
-# 通話録音の保存期間 (日)。⚠**0 = 掃除しない (既定)**。
-#
-# なぜ既定で消さないか (2026-08-01):
-#   録音は取り返しがつかない。8kHzモノラルで約1MB/分なので放置すれば必ず溜まるが、
-#   何日で消してよいかは運用の判断 (相手への告知内容とも関わる) で、こちらでは決められない。
-#   仕組みだけ置いて、日数を入れたときにだけ動く形にしてある。
-# ⚠これを有効にする前に、通話記録md (文字起こし) が残ることを確認すること。
-#   録音は「文字起こしが取りこぼした数字を後から耳で確認する」ための保険なので、
-#   文字起こしまで一緒に消える運用になっていたら保険の意味が無い。
-RECORDING_DIR = os.environ.get("RECORDING_DIR", "/recordings")
-RECORDING_RETENTION_DAYS = float(os.environ.get("RECORDING_RETENTION_DAYS") or "0")
-
-
-async def _recording_reaper(app: web.Application) -> None:
-    """保存期間を過ぎた録音を消す。RECORDING_RETENTION_DAYS が 0 なら何もしない。"""
-    if RECORDING_RETENTION_DAYS <= 0:
-        log.info("録音の掃除は無効 (RECORDING_RETENTION_DAYS 未設定)")
-        return
-    from pathlib import Path
-
-    cutoff_sec = RECORDING_RETENTION_DAYS * 86400
-    while True:
-        try:
-            now = time.time()
-            gone = bytes_freed = 0
-            for p in Path(RECORDING_DIR).glob("*.wav"):
-                try:
-                    st = p.stat()
-                    if now - st.st_mtime <= cutoff_sec:
-                        continue
-                    p.unlink()
-                    gone += 1
-                    bytes_freed += st.st_size
-                except OSError:
-                    # 録音中のファイル等。次の周回で拾えばよい
-                    continue
-            if gone:
-                log.info(
-                    "録音を掃除: %d件 %.1fMB (保存期間 %g日)",
-                    gone, bytes_freed / 1e6, RECORDING_RETENTION_DAYS,
-                )
-        except Exception:
-            log.exception("recording reaper failed (継続)")
-        await asyncio.sleep(3600)
+# 録音の掃除係はここにあった (RECORDING_RETENTION_DAYS)。2026-10-02 に worker へ移した —
+# 録音は Ogg にしてワークスペースの 録音/ へ移し、保存期間は管制室の設定 (recording_retention_days) で決める
+# (services/directory-agent/recordings.py)
 
 
 async def _security_notifier(app: web.Application) -> None:
@@ -877,6 +935,18 @@ async def make_app() -> web.Application:
         await app["pool"].execute(push.DDL)  # 端末のプッシュトークン表 (2026-09-18)
     except Exception:
         log.debug("push DDL", exc_info=True)
+    try:
+        await app["pool"].execute(presence.DDL)  # 待機・視聴・会話と保留 (2026-09-26)
+    except Exception:
+        log.exception("presence DDL")
+    try:
+        await app["pool"].execute(members.DDL)  # メンバー・招待・端末のログイン (2026-09-26)
+    except Exception:
+        log.exception("members DDL")
+    try:
+        await app["pool"].execute(schedule.DDL)  # 人ごとの受付時間 (2026-09-29)
+    except Exception:
+        log.exception("schedule DDL")
     # ⚠FCM の鍵は起動時に別スレッドで読んでおく (2026-09-24)。鍵の読み込み (RSA の解析) は同期処理で、
     #   最初の着信のときに初めて読むとイベントループが約 0.9 秒止まり、スタンバイの鳴動秒数と
     #   /pickup_wait の返りがずれた (test_answer_mode の「8秒で返る」が 8.93 秒で FAIL)
@@ -885,12 +955,13 @@ async def make_app() -> web.Application:
     async def _start_reaper(app: web.Application) -> None:
         app["reaper"] = asyncio.create_task(_reaper(app))
         app["notifier"] = asyncio.create_task(_security_notifier(app))
-        app["rec_reaper"] = asyncio.create_task(_recording_reaper(app))
 
     app.on_startup.append(_start_reaper)
     app.router.add_get("/prefetch", prefetch)
     app.router.add_get("/assistant", assistant)
     app.router.add_get("/answer_mode", answer_mode)
+    app.router.add_get("/answer_mode_info", answer_mode_info)
+    app.router.add_get("/answer_mode_set", answer_mode_set)
     app.router.add_get("/ringing_start", ringing_start)
     app.router.add_get("/ringing_phase", ringing_phase)
     app.router.add_get("/ringing_decide", ringing_decide)
@@ -904,6 +975,7 @@ async def make_app() -> web.Application:
     app.router.add_get("/handoff_state", handoff_state)
     app.router.add_get("/handoff_accept", handoff_accept)
     app.router.add_get("/handoff_result", handoff_result)
+    app.router.add_get("/transfer_candidates", transfer_candidates)
     app.router.add_get("/screen", screen)
     app.router.add_get("/guard", guard)
     app.router.add_get("/simulate_call", simulate_call)
@@ -916,4 +988,5 @@ async def make_app() -> web.Application:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    web.run_app(make_app(), host="0.0.0.0", port=8790)
+    # テナントごとに 1 つ (2026-10-04)。ポートは infra/tenants/tenants.json の hookd_host_port と揃える
+    web.run_app(make_app(), host="0.0.0.0", port=int(os.environ.get("HOOKD_PORT") or "8790"))

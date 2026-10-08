@@ -1,0 +1,11 @@
+{
+  "dispatch_rule": {
+    "name": "inbound-to-room-kumiai",
+    "trunk_ids": ["__KUMIAI_TRUNK_ID__"],
+    "rule": {
+      "dispatchRuleIndividual": {
+        "roomPrefix": "kumiai"
+      }
+    }
+  }
+}

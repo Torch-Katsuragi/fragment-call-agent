@@ -25,7 +25,32 @@ type CallDetail = {
   direction?: string;
   segments: Segment[];
   fragments?: Fragment[];
+  // 担い手 (2026-09-26): ai / human / hold / connecting。presence = ルームにいる端末
+  handler?: string | null;
+  ai_on?: boolean | null;
+  presence?: { id: string; name: string; role: string }[];
+  /** 会話した人の名前 (2026-10-04)。人の発話の見出しに使う */
+  handled_by?: string[] | null;
+  // 録音 (2026-10-02)。ワークスペースからの相対パス。NULL = 無い・消した
+  recording_path?: string | null;
 };
+
+// 担い手の見出し。会話中の人の名前を並べる
+function handlerLabel(call: CallDetail): string | null {
+  const talkers = (call.presence ?? []).filter((p) => p.role === "talk").map((p) => p.name || "端末");
+  switch (call.handler) {
+    case "human":
+      return `${talkers.join("・") || "本人"}が応対中`;
+    case "hold":
+      return "保留中";
+    case "connecting":
+      return "接続中";
+    case "ai":
+      return "AIが応対中";
+    default:
+      return null;
+  }
+}
 // 通話詳細 = web会議風レイアウト。
 // 中央: フラグメント (エージェントの思考が主役) + 下部バー、右: 会話ストリーム (全高固定レール)。
 // レール下端の入力からAIへ「耳打ち」できる (相手には聞こえない)。
@@ -129,7 +154,7 @@ export default function CallView({
       {active ? (
         <span className="badge-live">
           <span className="pulse-dot" />
-          通話中
+          {handlerLabel(call) ?? "通話中"}
           <Elapsed since={call.started_at} />
         </span>
       ) : (
@@ -149,6 +174,9 @@ export default function CallView({
       interim={interim}
       active={!!active}
       onSend={sendWhisper}
+      humanLabel={
+        call.handled_by?.length === 1 ? call.handled_by[0] : call.handled_by?.length ? "応対者" : "あなた"
+      }
     />
   );
 
@@ -156,9 +184,31 @@ export default function CallView({
     <>
       <div className="call-main">
         {header}
+        {/* 録音 (2026-10-02)。終話後に worker が Ogg にして置くので、終わった直後は 1 分ほど出ない */}
+        {!active && call.recording_path && (
+          <div className="call-recording">
+            <audio controls preload="none" src={`/api/calls/${id}/recording`} />
+            <span className="muted">録音 ・ 左が相手、右がこちら</span>
+          </div>
+        )}
         <FragmentsPanel items={call.fragments ?? []} />
         {isLive && (
-          <CallBar operator={cs.operator} onSwitch={cs.toggleOperator} onHangup={hangup} />
+          <CallBar
+            operator={cs.operator}
+            onHold={call.handler === "human" ? cs.leaveToHold : undefined}
+            onAiFromHold={
+              !cs.operator && call.handler === "hold"
+                ? () =>
+                    fetch(`/api/calls/${id}/ai`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ on: true }),
+                    }).catch(() => {})
+                : undefined
+            }
+            onSwitch={cs.toggleOperator}
+            onHangup={hangup}
+          />
         )}
       </div>
       {isLive ? <InterimAware render={rail} /> : rail()}
@@ -184,10 +234,16 @@ function Elapsed({ since }: { since: string }) {
 // web会議風の下部バー: デバイス選択・AIスイッチ・発話インジケータ・通話終了
 function CallBar({
   operator,
+  onHold,
+  onAiFromHold,
   onSwitch,
   onHangup,
 }: {
   operator: boolean;
+  /** 会話から抜けて保留にする (自分が会話中のときだけ) */
+  onHold?: () => void;
+  /** 保留中の通話を AI に渡す (自分が会話していないとき) */
+  onAiFromHold?: () => void;
   onSwitch: () => void;
   onHangup: () => void;
 }) {
@@ -232,9 +288,19 @@ function CallBar({
           title="自分の声を拾えていれば話すたびに光ります"
         />
       )}
+      {operator && onHold && (
+        <button className="bar-btn" onClick={onHold}>
+          ⏸ 保留
+        </button>
+      )}
       <button className={`bar-btn switch ${operator ? "to-ai" : "to-me"}`} onClick={onSwitch}>
         {operator ? "🤖 AIに任せる" : "🎙 自分が出る"}
       </button>
+      {onAiFromHold && (
+        <button className="bar-btn switch to-ai" onClick={onAiFromHold}>
+          🤖 AIに任せる
+        </button>
+      )}
       <div className="bar-spacer" />
       <button className="bar-btn danger" onClick={onHangup}>
         📞 通話終了
@@ -248,10 +314,12 @@ function Msg({
   speaker,
   text,
   interim,
+  humanLabel = "あなた",
 }: {
   speaker: string;
   text: string;
   interim?: boolean;
+  humanLabel?: string;
 }) {
   const who =
     speaker === "caller"
@@ -264,7 +332,7 @@ function Msg({
   const side = who === "caller" ? "left" : "right";
   const tag =
     who === "user"
-      ? "あなた"
+      ? humanLabel
       : who === "whisper"
         ? "🤫 耳打ち (相手には聞こえません)"
         : who === "ai"
@@ -306,12 +374,15 @@ function ChatRail({
   interim,
   active,
   onSend,
+  humanLabel,
 }: {
   segments: Segment[];
   pendingWhispers: string[];
   interim?: React.ReactNode;
   active: boolean;
   onSend: (text: string) => void;
+  /** 人の発話の見出し (2026-10-04)。事務所の子機が何台もあると「あなた」とは限らない */
+  humanLabel: string;
 }) {
   const [draft, setDraft] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -337,7 +408,7 @@ function ChatRail({
           <span className="muted">まだ発話がありません。</span>
         )}
         {segments.map((s) => (
-          <Msg key={s.seq} speaker={s.speaker} text={s.text} />
+          <Msg key={s.seq} speaker={s.speaker} text={s.text} humanLabel={humanLabel} />
         ))}
         {pendingWhispers.map((t, i) => (
           <Msg key={`pw-${i}`} speaker="whisper" text={t} interim />

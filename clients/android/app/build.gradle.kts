@@ -60,13 +60,12 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    // ペアリングQRの読み取り。⚠CameraX+ML Kitではなく Google Code Scanner を選んだ理由:
-    //   ①カメラ権限が要らない (スキャンUIはPlay開発者サービス側のプロセスで動く)
-    //   ②スキャン画面を自前で作らなくていい ③APKがほぼ増えない (モジュールは初回に配信される)
-    //   代償: **Google Play開発者サービスが要る**。入っていない端末では手入力に落とす
-    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
-
     // FCM (2026-09-18)。⚠google-services プラグインは入れない — 接続情報は管制室が配り、
     //   FirebaseOptions で手で初期化する (push/PushSetup.kt)。self-host ごとに Firebase が違うため
     implementation("com.google.firebase:firebase-messaging:24.1.0")
+
+    // Google アカウントでのログイン (2026-09-26、招待から参加・メンバーのログイン)。GoogleLogin.kt
+    implementation("androidx.credentials:credentials:1.5.0")
+    implementation("androidx.credentials:credentials-play-services-auth:1.5.0")
+    implementation("com.google.android.libraries.identity.googleid:googleid:1.1.1")
 }

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pool } from "@/lib/db";
-import { ANSWER_MODES, aiAnswers, isAnswerMode } from "@/lib/answerMode";
+import { ANSWER_MODES, aiAnswers, isAnswerMode, setModeByHand } from "@/lib/answerMode";
 
 export const dynamic = "force-dynamic";
 
@@ -8,7 +8,8 @@ export const dynamic = "force-dynamic";
 //
 // ⚠**スタンバイは本人の明示操作**。アプリの起動状態や画面の点灯から推測して
 //   ここを叩いてはいけない (見ていないのに鳴り続ける端末になる)。
-//   端末側の時限つき解除は Prefs.standbyUntil が持っていて、切れたら away を送ってくる。
+// ⚠スタンバイの切り忘れ対策 (8 時間で不在へ) と時間割への戻りはサーバー (hookd の schedule.py) が持つ
+//   (2026-09-29 に端末のタイマーから移した)。
 export async function POST(req: NextRequest) {
   let mode = "";
   try {
@@ -22,7 +23,9 @@ export async function POST(req: NextRequest) {
       { status: 400 },
     );
   }
-  // 古い2値も揃える (着信バナー等がまだ assistant_enabled を見ている)
+  const info = await setModeByHand(mode);
+  if (info) return NextResponse.json({ ok: true, answer_mode: mode, mode_info: info });
+  // hookd が落ちているときだけ直に書く。古い2値も揃える (着信バナー等がまだ assistant_enabled を見ている)
   for (const [key, value] of [
     ["answer_mode", mode],
     ["assistant_enabled", String(aiAnswers(mode))],

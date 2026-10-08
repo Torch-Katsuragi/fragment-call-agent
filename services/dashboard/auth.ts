@@ -1,13 +1,12 @@
 import NextAuth from "next-auth";
 import Google from "next-auth/providers/google";
-import { extractDeviceToken, verifyDeviceToken } from "@/lib/deviceToken";
+import { pool } from "@/lib/db";
+import { hasOpenInviteFor, memberByEmail } from "@/lib/members";
+import { TENANT_ID, tenantsOfEmail } from "@/lib/tenants";
 
-// 管制室は本人専用ツールのため、許可アカウント以外はログインさせない。
-// カンマ区切りで複数許可も可 (ALLOWED_EMAILS)。⚠未設定なら誰も入れない (安全側)
-const ALLOWED_EMAILS = (process.env.ALLOWED_EMAILS ?? "")
-  .split(",")
-  .map((e) => e.trim().toLowerCase())
-  .filter(Boolean);
+// 管制室に Google でログインしてよいのは、メンバー表 (lib/members.ts) にいる人と、招待を受けに来た人だけ
+// (2026-09-26。それまでは ALLOWED_EMAILS の固定リスト。今は ALLOWED_EMAILS は最初のオーナーの種)。
+// ⚠どのページ・API をどの権限で開けるかは middleware.ts が毎回判定する。ここはログインの門だけ
 
 // ⚠ AUTH_URL は本番(VM)では必ず設定する。未設定だと next-auth が自分のURLを
 //   `https://localhost:3000` と誤認し、未ログイン時の callbackUrl がそこを指して認証後に戻れない。
@@ -22,24 +21,22 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
   trustHost: true,
   providers: [Google],
   callbacks: {
-    signIn({ user }) {
-      return !!user.email && ALLOWED_EMAILS.includes(user.email.toLowerCase());
-    },
-    // middleware(auth as middleware)がルート保護するかどうかはこれで決まる。
-    // signInコールバックだけではログイン許可の絞り込みにしかならず、未ログイン時のリダイレクトは発生しない
-    async authorized({ auth, request }) {
-      // ローカル開発 (next dev) だけ認証を省く。**本番ビルド (next start) では必ず要求する**。
-      // ⚠ 以前は request.nextUrl.hostname が localhost かで判定していたが、
-      //   Caddy が upstream へ Host: localhost:3000 で転送するため公開URLでも
-      //   バイパスが成立し、未ログインで管制室が丸見えになっていた (2026-07-26に実測)。
-      //   ホスト名はプロキシ次第で信用できない — 環境で判定し、既定は閉じる (fail-closed)
-      if (process.env.NODE_ENV === "development") return true;
-      if (auth?.user) return true;
-      // スマホアプリ (専用電話アプリ) の端末トークン。
-      // ⚠WebView の中では Google ログインができない (`disallowed_useragent`) ので、
-      //   アプリだけはこの経路で入る。詳細と失効のさせ方は lib/deviceToken.ts の冒頭コメント。
-      // ⚠ここは Edge runtime なので DB は引けない — 署名の検証だけで判定している
-      return !!(await verifyDeviceToken(extractDeviceToken(request)));
+    async signIn({ user }) {
+      const email = user.email?.toLowerCase();
+      if (!email) return false;
+      const m = await memberByEmail(email);
+      if (m) {
+        if (m.status !== "active") return "/login?error=banned";
+        // 名前は Google アカウントのものに揃える (ほかの端末に「〇〇が応対中」と出る名前)
+        if (user.name && user.name !== m.name) {
+          await pool.query("UPDATE members SET name = $2 WHERE id = $1", [m.id, user.name]).catch(() => {});
+        }
+        return true;
+      }
+      // メンバーでなくても、そのアドレス宛ての招待があれば通す (招待のページで受ける)
+      if (await hasOpenInviteFor(email)) return true;
+      // 同居構成 (2026-10-04): 他の管制室のメンバーなら通す。middleware がその管制室へ回す
+      return (await tenantsOfEmail(email)).some((t) => t.id !== TENANT_ID);
     },
   },
   pages: {

@@ -12,7 +12,15 @@ type CallItem = {
   direction: string;
   active: boolean;
   preview: { speaker: string; text: string }[];
+  /** 会話した人の名前 (2026-10-04)。空 = 記録の無い古い通話 */
+  handled_by?: string[] | null;
 };
+
+/** 人の発話の見出し。応対した人が 1 人ならその名前、複数なら「応対者」、記録が無ければ「本人」 */
+function humanLabel(names?: string[] | null): string {
+  if (names?.length === 1) return names[0];
+  return names?.length ? "応対者" : "本人";
+}
 
 // 通話履歴の全画面。
 //
@@ -103,7 +111,7 @@ function HistRow({ c }: { c: CallItem }) {
           {preview.map((p, i) => (
             <div key={i}>
               <span className={`speaker ${p.speaker}`}>
-                {p.speaker === "caller" ? "相手" : p.speaker === "ai" ? "AI" : "本人"}
+                {p.speaker === "caller" ? "相手" : p.speaker === "ai" ? "AI" : humanLabel(c.handled_by)}
               </span>{" "}
               {p.text}
             </div>

@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { FRAGMENT_WORKSPACE } from "./env";
+import { contactFile, contactFileForWrite } from "./phonebook";
 
 // 「緊急呼び出しを許可した相手」の台帳。実体は電話帳md
-// (フラグメント/連絡先/<番号>.md) の frontmatter にある `緊急呼び出し` プロパティ。
+// (フラグメント/連絡先/<番号>/<番号>.md) の frontmatter にある `緊急呼び出し` プロパティ。
 //
 // ⚠**なぜ番号や名前で自動判定しないのか** (2026-08-01の調査で確定):
 //   日本では発信者番号の偽装が現在進行形の主要手口で、警察庁が「表示された番号を
@@ -27,8 +28,9 @@ export type UrgentState = "allowed" | "denied" | "unset";
 
 const FLAG = "緊急呼び出し";
 
+// 読みは新旧どちらの形でも (無ければ新しい形の場所を返し、読めずに unset になる)
 function mdPath(number: string): string {
-  return path.join(FRAGMENT_WORKSPACE, "連絡先", `${number}.md`);
+  return contactFile(number) ?? path.join(FRAGMENT_WORKSPACE, "連絡先", number, `${number}.md`);
 }
 
 function isValid(number: string): boolean {
@@ -54,7 +56,8 @@ export function urgentState(number: string): UrgentState {
  */
 export function setUrgentState(number: string, allowed: boolean): void {
   if (!isValid(number)) throw new Error("invalid number");
-  const p = mdPath(number);
+  // 書くときは新しい形 (連絡先/<番号>/<番号>.md) へ移してから
+  const p = contactFileForWrite(number);
   const line = `${FLAG}: ${allowed}`;
   let md: string;
   try {

@@ -8,12 +8,37 @@
 #          アカウントカードが「ローカル開発 (localhost)」表示になる。
 #    2026-07-26の認証バイパス事故(公開URLでlocalhost判定が成立して管制室が丸見え)と同じ根本原因。
 #    あの時は判定側を NODE_ENV に変えて塞いだが、Hostヘッダー自体は直していなかった (2026-07-30に修正)
+(fwd) {
+    header_up Host {host}
+    header_up X-Forwarded-Host {host}
+    header_up X-Forwarded-Proto {scheme}
+    header_up X-Forwarded-For {remote_host}
+}
+
+# 同居構成 (2026-10-04): 管制室はテナントごとに別プロセスで、入口はこの 1 つ。行き先は
+#   ・ブラウザ … Cookie fr_tenant=<id> (ログイン時と切り替えで管制室が付ける、/api/public/tenant)
+#   ・アプリ   … 端末のトークンの頭 fr1_<id>_ (Authorization: Bearer)
+#   どれにも当たらなければ main (ユーザー本人の管制室、3000)。ポートは infra/tenants/tenants.json の dashboard_port
+# ⚠振り分けは「どの管制室に行くか」だけ。入れるかは行き先がメンバー表で毎回判定する
 (dashboard) {
-    reverse_proxy localhost:3000 {
-        header_up Host {host}
-        header_up X-Forwarded-Host {host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote_host}
+    @kumiai {
+        header_regexp kc Cookie (^|;\s*)fr_tenant=kumiai(;|$)
+    }
+    @kumiai_device_bearer header_regexp kb Authorization ^Bearer\s+fr1_kumiai_
+    handle @kumiai_device_bearer {
+        reverse_proxy localhost:3001 {
+            import fwd
+        }
+    }
+    handle @kumiai {
+        reverse_proxy localhost:3001 {
+            import fwd
+        }
+    }
+    handle {
+        reverse_proxy localhost:3000 {
+            import fwd
+        }
     }
 }
 
