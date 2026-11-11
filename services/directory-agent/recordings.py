@@ -38,6 +38,8 @@ _RAW_RE = re.compile(r"^(\d{8}_\d{6})_(in|out)_([^_]*)_(.+)$")
 _OUT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_")
 # まだ書き込み中かもしれない録音には触らない (MixMonitor は通話中ずっと書き続ける)
 SETTLE_SEC = 60
+# 通話が終了 (calls.ended_at IS NOT NULL) している場合は MixMonitor も閉じているので短くてよい
+ENDED_SETTLE_SEC = 2
 # 一度失敗した録音を毎回やり直さない (壊れた wav でループしない)。プロセスが替われば再挑戦
 _failed: set[str] = set()
 
@@ -55,19 +57,20 @@ def _encode(files: dict[str, Path], out: Path) -> None:
     """生の wav を Ogg Opus 1 本にする。rx/tx が揃っていればステレオ、無ければ混合をモノラルで"""
     tmp = out.with_suffix(".tmp.ogg")
     rx, tx = files.get("rx"), files.get("tx")
+    prefix = ["nice", "-n", "19"] if os.name == "posix" else []
     if rx and tx:
         # ⚠rx と tx は長さが少しずれる。amerge は短い方で切れるので、長い方に揃えて無音で埋める
         dur = max(_wav_seconds(rx), _wav_seconds(tx))
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error", "-i", str(rx), "-i", str(tx),
+        cmd = prefix + [
+            "ffmpeg", "-y", "-threads", "1", "-loglevel", "error", "-i", str(rx), "-i", str(tx),
             "-filter_complex",
             f"[0:a]apad=whole_dur={dur:.3f}[a];[1:a]apad=whole_dur={dur:.3f}[b];[a][b]amerge=inputs=2[s]",
             "-map", "[s]", "-c:a", "libopus", "-b:a", "32k", "-application", "voip", str(tmp),
         ]
     else:
         src = files.get("mix") or rx or tx
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+        cmd = prefix + [
+            "ffmpeg", "-y", "-threads", "1", "-loglevel", "error", "-i", str(src),
             "-c:a", "libopus", "-b:a", "24k", "-application", "voip", str(tmp),
         ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -119,11 +122,11 @@ def unlink_in_md(workspace: Path, room: str, rel: str) -> None:
     p.write_text(text, encoding="utf-8")
 
 
-async def import_raw(pool, workspace: Path) -> None:
+async def import_raw(pool, workspace: Path) -> list[dict]:
     """書き終わった生の録音を Ogg Opus にして録音フォルダへ移し、通話と md に結びつける。
     ⚠生の wav は変換に成功したら消す (VM のディスクを食わせない)。失敗したら残して記録する"""
     if not RAW_DIR.is_dir():
-        return
+        return []
     groups: dict[str, dict[str, Path]] = {}
     for p in RAW_DIR.glob("*.wav"):
         stem = p.stem
@@ -133,6 +136,7 @@ async def import_raw(pool, workspace: Path) -> None:
                 stem, kind = stem[: -len(k) - 1], k
         groups.setdefault(stem, {})[kind] = p
     now = time.time()
+    imported: list[dict] = []
     for base in sorted(groups):
         files = groups[base]
         if base in _failed:
@@ -144,23 +148,28 @@ async def import_raw(pool, workspace: Path) -> None:
             newest = max(f.stat().st_mtime for f in files.values())
         except FileNotFoundError:
             continue
-        if now - newest < SETTLE_SEC:
-            continue
         t = datetime.strptime(m[1], "%Y%m%d_%H%M%S").replace(tzinfo=JST)
         number = m[3]
         # 録音の始まり (関門の直後) から AI/本人がルームに入る (calls 行ができる) までには、
         # 録音告知・呼び出し (スタンバイ 8 秒・人が出る相手 20 秒・自分で出る 42 秒) が挟まる
         call = await pool.fetchrow(
-            """SELECT id, room_name, ended_at FROM calls
+            """SELECT id, room_name, caller_number, started_at, ended_at, summary_md FROM calls
                WHERE caller_number = $1 AND recording_path IS NULL
                  AND started_at BETWEEN $2::timestamptz - interval '30 seconds' AND $2::timestamptz + interval '3 minutes'
                ORDER BY started_at LIMIT 1""",
             number,
             t,
         )
-        # 通話中ならまだ (⚠ただし agent が落ちて ended_at が付かないまま 1 時間たったものは進める)
-        if call and call["ended_at"] is None and now - newest < 3600:
-            continue
+        if call:
+            # 通話中ならまだ (⚠ただし agent が落ちて ended_at が付かないまま 1 時間たったものは進める)
+            if call["ended_at"] is None:
+                if now - newest < 3600:
+                    continue
+            elif now - newest < ENDED_SETTLE_SEC:
+                continue
+        else:
+            if now - newest < SETTLE_SEC:
+                continue
         name = f"{t:%Y-%m-%d_%H%M%S}_{number or 'unknown'}"
         rel = f"{REC_DIR_NAME}/{t:%Y-%m}/{name}.ogg"
         out = workspace / rel
@@ -182,10 +191,20 @@ async def import_raw(pool, workspace: Path) -> None:
                 link_in_md(workspace, call["room_name"], rel)
             except Exception:
                 log.exception("recording: md に埋め込めない %s", rel)
+            imported.append({
+                "id": call["id"],
+                "room_name": call["room_name"],
+                "caller_number": call["caller_number"],
+                "started_at": call["started_at"],
+                "ended_at": call["ended_at"],
+                "recording_path": rel,
+                "summary_md": call["summary_md"],
+            })
         for f in files.values():
             f.unlink(missing_ok=True)
         log.info("recording: %s (%s, %.0fKB)", rel, "通話あり" if call else "通話なし",
                  out.stat().st_size / 1024)
+    return imported
 
 
 def _rec_date(p: Path) -> date | None:

@@ -83,7 +83,7 @@ async def rank(cands: list[dict], convo: list[tuple[str, str]]) -> list[dict]:
     """
     if len(cands) < 2 or not vertex.available() or not convo:
         return cands
-    model = os.environ.get("RANK_MODEL", "gemini-3.8-flash")
+    model = vertex.resolve_model(os.environ.get("RANK_MODEL", "gemini-flash-latest"))
     lines = "\n".join(f"{i}. {c['name']}（担当: {c['role'] or 'なし'}）" for i, c in enumerate(cands))
     talk = "\n".join(f"{'相手' if s == 'caller' else '応対側'}: {t}" for s, t in convo[-20:])
     body = {
@@ -101,6 +101,10 @@ async def rank(cands: list[dict], convo: list[tuple[str, str]]) -> list[dict]:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as s:
             async with s.post(url, headers=headers, json=body) as r:
                 data = await r.json()
+            if "candidates" not in data and model != "gemini-3.8-flash":
+                fallback_url = vertex.url("models/gemini-3.8-flash:generateContent")
+                async with s.post(fallback_url, headers=headers, json=body) as r2:
+                    data = await r2.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         out = json.loads(text)
         order = [int(i) for i in out.get("order", []) if 0 <= int(i) < len(cands)]

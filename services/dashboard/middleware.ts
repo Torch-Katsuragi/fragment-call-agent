@@ -3,7 +3,6 @@ import { auth } from "@/auth";
 import { extractDeviceToken } from "@/lib/deviceToken";
 import { identifyDevice, identifyEmail, type Who } from "@/lib/members";
 import { atLeast, requiredRole } from "@/lib/roles";
-import { TENANT_ID, tenantsOfEmail } from "@/lib/tenants";
 
 // 管制室の入口 (2026-09-26 にメンバーと権限の判定へ)。
 // ⚠Node で動かす (runtime: nodejs)。以前は Edge で DB が引けず、端末トークンは署名だけで判定していた =
@@ -31,17 +30,6 @@ export default auth(async (req) => {
   }
 
   const api = pathname.startsWith("/api/");
-  // 同居構成 (2026-10-04): ここのメンバーではないが他の管制室のメンバーなら、そちらへ回す。
-  //   入口は fragment.example.com 1 つで、どの管制室に行くかは Cookie fr_tenant (Caddy が見る)
-  if (!who && !api && req.auth?.user?.email) {
-    const other = (await tenantsOfEmail(req.auth.user.email)).find((t) => t.id !== TENANT_ID);
-    if (other) {
-      const url = new URL("/api/public/tenant", req.nextUrl);
-      url.searchParams.set("to", other.id);
-      url.searchParams.set("next", req.nextUrl.pathname + req.nextUrl.search);
-      return NextResponse.redirect(url);
-    }
-  }
   if (!who || who.member.status !== "active") {
     if (api) return NextResponse.json({ error: who ? "利用を止められています" : "ログインが必要です" }, { status: who ? 403 : 401 });
     const url = new URL("/login", req.nextUrl);

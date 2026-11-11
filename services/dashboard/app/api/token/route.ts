@@ -1,9 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { AccessToken } from "livekit-server-sdk";
-import { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_PUBLIC_WS_URL } from "@/lib/env";
+import { LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_PUBLIC_WS_URL, ownsRoom } from "@/lib/env";
 import { deviceFrom } from "@/lib/device";
 import { atLeast } from "@/lib/roles";
-import { ownsRoom } from "@/lib/tenants";
 
 export const dynamic = "force-dynamic";
 
@@ -20,8 +19,7 @@ export async function GET(req: NextRequest) {
   if (!room) {
     return NextResponse.json({ error: "room is required" }, { status: 400 });
   }
-  // ⚠他のテナントの通話には入らせない (2026-10-04、同居構成)。LiveKit は全テナント共有なので、
-  //   ここで止めないと部屋名さえ分かれば他の管制室の通話を聴けてしまう
+  // ROOM_PREFIX 以外のルームにはトークンを発行しない
   if (!ownsRoom(room)) {
     return NextResponse.json({ error: "この管制室の通話ではありません" }, { status: 403 });
   }

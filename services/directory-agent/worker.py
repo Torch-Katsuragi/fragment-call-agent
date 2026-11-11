@@ -16,6 +16,7 @@
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -50,9 +51,11 @@ WORKSPACE = Path(
 )
 BACKEND = os.environ.get("DIRECTORY_AGENT_BACKEND", "auto")
 # ⚠Google の最新 Flash に追従する方針 (2026-09-25 ユーザー「言わなくてもまめにアプデ」)。
-#   3.6→3.8: 番号検索の実測で 3.6 3〜5秒 / 3.8 2〜6秒、地元の番号 (地元の事業所・役場) は 3.8 が当てる。
+#   AI Studio は gemini-flash-latest、Vertex AI は vertex.py が gemini-3.8-flash に解決する (2026-11-09)。
 #   Flash-Lite は1.5秒だが地元の番号を全部「不明」にしたので速さのためには下げない
-GEMINI_MODEL = os.environ.get("DIRECTORY_AGENT_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.environ.get("DIRECTORY_AGENT_MODEL", "gemini-flash-latest")
+# 終話後の録音全文清書は精度最優先で Pro (Vertex AI では gemini-4-argon に解決) を使う (2026-11-09)
+PRO_MODEL = os.environ.get("DIRECTORY_AGENT_PRO_MODEL", "gemini-pro-latest")
 # 取り次ぎ要求の宛先 (判断層のOR発火)。ホスト実行時はhookdの公開ポート、
 # コンテナ実行時はcomposeが HOOKD_URL=http://hookd:8790 を注入する。
 # ⚠host.docker.internal を既定にしない — Linuxでは解決できず、agent側で
@@ -129,6 +132,7 @@ def call_gemini(
     json_mode: bool = False,
     google_search: bool = False,
     cached: str | None = None,
+    use_pro: bool = False,
 ) -> str:
     # ⚠thinkingBudget:0 は使わない (2026-08-01)。3.5では黙って無視されていたが、
     #   **3.6は400で拒否する** — このワンパラメータでworkerのGemini呼び出しが全滅し、
@@ -150,12 +154,19 @@ def call_gemini(
     if google_search:
         # Google検索グラウンディング (⚠json_modeとは併用不可)
         body["tools"] = [{"google_search": {}}]
-    data = _gemini_rest("POST", f"models/{GEMINI_MODEL}:generateContent", body, timeout=60)
+    primary = PRO_MODEL if (use_pro and not cached) else GEMINI_MODEL
+    used_model = primary
+    try:
+        data = _gemini_rest("POST", f"models/{primary}:generateContent", body, timeout=60)
+    except Exception:
+        used_model = GEMINI_MODEL if primary != GEMINI_MODEL else "gemini-3.8-flash"
+        data = _gemini_rest("POST", f"models/{used_model}:generateContent", body, timeout=60)
     # 使った量を残す (2026-10-02、費用の内訳を測るため)。cached = 暗黙キャッシュに当たった分 (安い)
     u = data.get("usageMetadata") or {}
     log.info(
-        "gemini usage [%s]: prompt=%s cached=%s out=%s",
+        "gemini usage [%s/%s]: prompt=%s cached=%s out=%s",
         _PROMPT_TAGS.get(system_prompt, system_prompt[:12].replace("\n", " ")) + ("+cache" if cached else ""),
+        vertex.resolve_model(used_model),
         u.get("promptTokenCount"), u.get("cachedContentTokenCount", 0),
         (u.get("candidatesTokenCount") or 0) + (u.get("thoughtsTokenCount") or 0),
     )
@@ -169,7 +180,9 @@ _PROMPT_TAGS: dict[str, str] = {}
 def answer_with_gemini(question: str) -> str:
     ctx = gather_workspace()
     return call_gemini(
-        SYSTEM_PROMPT, f"# ワークスペースの内容\n{ctx}\n\n# 電話AIからの質問\n{question}"
+        SYSTEM_PROMPT,
+        f"# ワークスペースの内容\n{ctx}\n\n# 電話AIからの質問\n{question}",
+        use_pro=True,
     )
 
 
@@ -958,6 +971,160 @@ async def watch_conversations(pool: asyncpg.Pool) -> None:
             log.info("watch: 変更なし (call %s..., seq %s)", cid[:8], last_caller)
 
 
+async def write_call_transcript_md(pool: asyncpg.Pool, c) -> Path | None:
+    """1 通話分の 通話記録/*.md を書き出す (既存があれば上書き)。"""
+    rec_dir = WORKSPACE / "通話記録"
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    segs = await pool.fetch(
+        "SELECT seq, speaker, text FROM transcript_segments WHERE call_id=$1 ORDER BY id",
+        c["id"],
+    )
+    if not segs or not c["ended_at"]:
+        return None
+    started = c["started_at"].astimezone()  # ローカル時刻 (JST)
+    caller = c["caller_number"] or "unknown"
+    dur = int((c["ended_at"] - c["started_at"]).total_seconds())
+    suffix = c["room_name"].rsplit("_", 1)[-1]
+    name = f"{started:%Y-%m-%d_%H%M}_{caller}_{suffix}.md"
+    lines = [
+        "---",
+        f"caller: \"{caller}\"",
+        f"started: {started:%Y-%m-%d %H:%M}",
+        f"duration_sec: {dur}",
+        f"room: {c['room_name']}",
+        "tags: [フラグメント, 通話記録]",
+        "---",
+        "",
+        f"# 通話記録 {started:%Y-%m-%d %H:%M} ({caller})",
+        "",
+    ]
+    if c["recording_path"]:
+        lines += [recordings.embed_line(c["recording_path"]), ""]
+    for s in segs:
+        label = SPEAKER_LABEL.get(s["speaker"], s["speaker"])
+        lines.append(f"- **{label}**: {s['text']}")
+    out_path = rec_dir / name
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out_path
+
+
+REFINE_RECORDING_PROMPT = """あなたは電話の通話録音から文字起こしを清書する専門エディタです。
+添付されたステレオ音声（左チャンネル＝相手 caller、右チャンネル＝AI または 本人 user）と、
+リアルタイム音声認識で作られた下書きセグメント一覧（JSON）を照合し、各セグメントの `text` を実際の音声に忠実で自然な日本語に修正してください。
+
+ルール:
+- 出力は入力と同じ `seq` を持つ JSON 配列 `[{"seq": 1, "text": "..."}, ...]` のみとする
+- `speaker` が `ai` または `whisper` のセグメントは、文脈の参照のみに使い、元の `text` をそのまま維持する
+- `speaker` が `caller`（左ch）または `user`（右ch）のセグメントは、録音音声を聴いて誤認識・聞き漏らし・文脈に合わない単語を正確に直す
+- リアルタイム認識で途中までしか拾えていない発話や、別の一言に化けている発話があれば、同じ発話ターン内で実際に話されている内容へ復元する
+- 電話の自動アナウンス（「お繋ぎいたします」「このままお待ちください」等）や環境ノイズが紛れ込んでいる場合は取り除く
+- 話していない内容を創作しない。自然な話し言葉と句読点（。、？）に整える"""
+
+
+def refine_recording_with_gemini(ogg_bytes: bytes, draft_segs: list[dict]) -> list[dict]:
+    b64 = base64.b64encode(ogg_bytes).decode("ascii")
+    user_text = (
+        "# リアルタイム文字起こし（下書き）\n"
+        + json.dumps(draft_segs, ensure_ascii=False, indent=2)
+        + "\n\n録音音声を聴いて、各セグメントの text を清書した JSON 配列のみを出力してください。"
+    )
+    body = {
+        "system_instruction": {"parts": [{"text": REFINE_RECORDING_PROMPT}]},
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"inlineData": {"mimeType": "audio/ogg", "data": b64}},
+                {"text": user_text},
+            ],
+        }],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingLevel": "low"},
+        },
+    }
+    used_model = PRO_MODEL
+    try:
+        data = _gemini_rest("POST", f"models/{PRO_MODEL}:generateContent", body, timeout=120)
+    except Exception:
+        time.sleep(2.0)
+        try:
+            data = _gemini_rest("POST", f"models/{PRO_MODEL}:generateContent", body, timeout=120)
+        except Exception:
+            used_model = GEMINI_MODEL
+            data = _gemini_rest("POST", f"models/{GEMINI_MODEL}:generateContent", body, timeout=120)
+    u = data.get("usageMetadata") or {}
+    log.info(
+        "gemini usage [refine_recording/%s]: prompt=%s out=%s",
+        vertex.resolve_model(used_model),
+        u.get("promptTokenCount"),
+        (u.get("candidatesTokenCount") or 0) + (u.get("thoughtsTokenCount") or 0),
+    )
+    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\n?|```$", "", raw).strip()
+    parsed = json.loads(raw)
+    if isinstance(parsed, dict):
+        for v in parsed.values():
+            if isinstance(v, list):
+                return v
+    return parsed if isinstance(parsed, list) else []
+
+
+async def refine_call_transcript_from_recording(pool: asyncpg.Pool, c) -> bool:
+    """終話後の録音 (.ogg) 全体を Gemini Pro (Argon) で聴き直し、transcript_segments と通話記録 md を清書する。"""
+    segs = await pool.fetch(
+        "SELECT id, seq, speaker, text FROM transcript_segments WHERE call_id=$1 ORDER BY seq, id",
+        c["id"],
+    )
+    if not any(s["speaker"] in ("caller", "user") for s in segs):
+        return False
+    ogg_path = WORKSPACE / c["recording_path"]
+    if not ogg_path.is_file() or ogg_path.stat().st_size > 15 * 1024 * 1024:
+        return False
+    draft = [{"seq": s["seq"], "speaker": s["speaker"], "text": s["text"]} for s in segs]
+    t0 = time.monotonic()
+    try:
+        ogg_bytes = ogg_path.read_bytes()
+        refined_list = await asyncio.get_running_loop().run_in_executor(
+            None, refine_recording_with_gemini, ogg_bytes, draft
+        )
+    except Exception:
+        log.exception("recording refine failed: %s", c["id"])
+        return False
+    by_seq = {
+        int(item["seq"]): str(item.get("text") or "").strip()
+        for item in refined_list
+        if isinstance(item, dict) and isinstance(item.get("seq"), (int, float))
+    }
+    updated = 0
+    for s in segs:
+        if s["speaker"] not in ("caller", "user"):
+            continue
+        new_text = by_seq.get(s["seq"])
+        if new_text and new_text != s["text"]:
+            await pool.execute(
+                "UPDATE transcript_segments SET text=$2 WHERE id=$1", s["id"], new_text
+            )
+            log.info(
+                "recording refined (%s #%s %s): %r -> %r",
+                str(c["id"])[:8], s["seq"], s["speaker"], s["text"], new_text,
+            )
+            updated += 1
+    log.info(
+        "recording refine done (%s, %.1fs): %d/%d segments updated",
+        str(c["id"])[:8], time.monotonic() - t0, updated, len(segs),
+    )
+    if updated:
+        await write_call_transcript_md(pool, c)
+        if c.get("summary_md") is not None:
+            summary, _, _, _ = await summarize_call(pool, c)
+            if summary:
+                await pool.execute("UPDATE calls SET summary_md=$2 WHERE id=$1", c["id"], summary)
+                log.info("call summary refreshed after refine %s: %s", c["id"], summary[:80])
+    return updated > 0
+
+
 async def export_transcripts(pool: asyncpg.Pool) -> None:
     """終了済み通話を 通話記録/*.md に書き出す (存在チェックはroom名で)。"""
     rec_dir = WORKSPACE / "通話記録"
@@ -971,35 +1138,11 @@ async def export_transcripts(pool: asyncpg.Pool) -> None:
         suffix = c["room_name"].rsplit("_", 1)[-1]
         if suffix in existing:
             continue
-        segs = await pool.fetch(
-            "SELECT seq, speaker, text FROM transcript_segments WHERE call_id=$1 ORDER BY id",
-            c["id"],
-        )
-        if not segs:
+        out_path = await write_call_transcript_md(pool, c)
+        if not out_path:
             continue
-        started = c["started_at"].astimezone()  # ローカル時刻 (JST)
+        log.info("exported %s", out_path.name)
         caller = c["caller_number"] or "unknown"
-        dur = int((c["ended_at"] - c["started_at"]).total_seconds())
-        name = f"{started:%Y-%m-%d_%H%M}_{caller}_{suffix}.md"
-        lines = [
-            "---",
-            f"caller: \"{caller}\"",
-            f"started: {started:%Y-%m-%d %H:%M}",
-            f"duration_sec: {dur}",
-            f"room: {c['room_name']}",
-            "tags: [フラグメント, 通話記録]",
-            "---",
-            "",
-            f"# 通話記録 {started:%Y-%m-%d %H:%M} ({caller})",
-            "",
-        ]
-        if c["recording_path"]:
-            lines += [recordings.embed_line(c["recording_path"]), ""]
-        for s in segs:
-            label = SPEAKER_LABEL.get(s["speaker"], s["speaker"])
-            lines.append(f"- **{label}**: {s['text']}")
-        (rec_dir / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
-        log.info("exported %s", name)
         # 電話帳mdが無い相手は雛形を自動作成 (相手ごとのメモリ。中身は人間/エージェントが育てる)。
         #
         # ⚠**テスト通話では作らない** (2026-08-01)。自動テストは毎回違うダミー番号を使うので、
@@ -1042,6 +1185,7 @@ async def summarize_ended_calls(pool: asyncpg.Pool) -> None:
            WHERE ended_at IS NOT NULL AND summary_md IS NULL
              AND direction = 'inbound' AND answered_by = 'ai'
              AND ended_at > now() - interval '1 hour'
+             AND (recording_path IS NOT NULL OR room_name LIKE '%_sim%' OR ended_at < now() - interval '15 seconds')
            ORDER BY ended_at LIMIT 1"""
     )
     if not c:
@@ -1049,6 +1193,7 @@ async def summarize_ended_calls(pool: asyncpg.Pool) -> None:
             """SELECT id, caller_number, room_name, started_at, ended_at FROM calls
                WHERE ended_at IS NOT NULL AND summary_md IS NULL
                  AND NOT EXISTS (SELECT 1 FROM calls WHERE ended_at IS NULL)
+                 AND (recording_path IS NOT NULL OR room_name LIKE '%_sim%' OR ended_at < now() - interval '15 seconds')
                ORDER BY ended_at DESC LIMIT 1"""
         )
     if not c:
@@ -1100,7 +1245,10 @@ async def summarize_call(pool: asyncpg.Pool, c) -> tuple[str, str, str, str]:
                 f"# 発信者番号\n{c['caller_number']}\n\n"
                 f"# 番号検索の結果\n{_lookup_text(c['caller_number'] or '') or '(なし)'}\n\n"
                 f"# 文字起こし\n{convo}",
-                True
+                True,
+                False,
+                None,
+                True,
             )
             j = json.loads(out)
             summary = str(j.get("summary") or "").strip()[:200]
@@ -1157,31 +1305,47 @@ for _name in ("SYSTEM_PROMPT", "DIGEST_PROMPT", "WATCHER_PROMPT", "CALL_SUMMARY_
     globals()[_name] = globals()[_name].replace("{OWNER}", OWNER_NAME)
 
 
-async def main() -> None:
-    log.info("workspace=%s backend=%s dsn=%s", WORKSPACE, resolve_backend(), DSN.split("@")[-1])
-    if not WORKSPACE.exists():
-        log.error("ワークスペースが見つかりません: %s", WORKSPACE)
-        sys.exit(1)
-    pool = await asyncpg.create_pool(DSN, min_size=1, max_size=5)
-    asyncio.create_task(lookup_loop(pool))
-    tick = 0
+async def post_call_loop(pool: asyncpg.Pool) -> None:
+    """終話後の重い後処理 (録音取り込み・Argon 全文清書・要約・電話帳自動更新・通話記録書き出し・定期保守) を
+    独立タスクとして3秒周期で回す。main() の着信下調べ (caller_context) や会話監視を一切ブロックしない。"""
+    post_tick = 0
     while True:
         try:
-            await process_jobs(pool)
-            await summarize_ended_calls(pool)  # 終話通知の本文
-            await watch_conversations(pool)  # 会話監視 (相手の新発話があった時だけLLM)
-            if tick % 30 == 0:  # 30秒ごと
+            for rec_call in await recordings.import_raw(pool, WORKSPACE):
+                await refine_call_transcript_from_recording(pool, rec_call)
+            await summarize_ended_calls(pool)  # 終話通知の本文 (録音清書後または終話15秒後)
+            if post_tick % 10 == 0:  # 30秒ごと (3秒 × 10)
                 await export_transcripts(pool)
-                await recordings.import_raw(pool, WORKSPACE)
-            if tick % 3600 == 600:  # 1時間ごと (起動直後は避ける)
+            if post_tick % 1200 == 200:  # 1時間ごと (起動直後は避ける)
                 await recordings.apply_retention(pool, WORKSPACE)
                 await recordings.forget_missing(pool, WORKSPACE)
                 await refresh_lookup_names(pool)
                 await asyncio.get_running_loop().run_in_executor(None, fill_phonebook_names)
                 await asyncio.get_running_loop().run_in_executor(None, fill_phonebook_kana)
         except Exception:
+            log.exception("post_call_loop error (継続)")
+        post_tick += 1
+        await asyncio.sleep(3)
+
+
+async def main() -> None:
+    log.info("workspace=%s backend=%s dsn=%s", WORKSPACE, resolve_backend(), DSN.split("@")[-1])
+    if not WORKSPACE.exists():
+        log.error("ワークスペースが見つかりません: %s", WORKSPACE)
+        sys.exit(1)
+    pool = await asyncpg.create_pool(DSN, min_size=1, max_size=8)
+    try:
+        await refresh_lookup_names(pool)
+    except Exception:
+        log.exception("initial refresh_lookup_names failed (継続)")
+    asyncio.create_task(lookup_loop(pool))
+    asyncio.create_task(post_call_loop(pool))
+    while True:
+        try:
+            await process_jobs(pool)
+            await watch_conversations(pool)  # 会話監視 (相手の新発話があった時だけLLM)
+        except Exception:
             log.exception("loop error (継続)")
-        tick += 1
         await asyncio.sleep(1)
 
 

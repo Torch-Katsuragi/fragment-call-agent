@@ -93,6 +93,7 @@ object CallAudio {
     private var room: Room? = null
     private var roomName: String? = null
     private var roomOperator = false
+    private var audioSwitchStarted = false
     private var jobs = mutableListOf<Job>()
     private var proximity: PowerManager.WakeLock? = null
 
@@ -156,7 +157,7 @@ object CallAudio {
 
         if (want != roomName || (want != null && wantOperator != roomOperator)) {
             teardown()
-            if (want != null) connect(ctx, want, wantOperator)
+            if (want != null) connect(ctx, want, wantOperator, audible)
         }
         val r = room ?: run {
             _state.value = State(error = _state.value.error.takeIf { want != null })
@@ -168,8 +169,8 @@ object CallAudio {
         updateProximity(ctx)
     }
 
-    private suspend fun connect(ctx: Context, name: String, operator: Boolean) {
-        _state.value = State(room = name, operator = operator)
+    private suspend fun connect(ctx: Context, name: String, operator: Boolean, audible: Boolean) {
+        _state.value = State(room = name, operator = operator, audible = audible)
         val tok = withContext(Dispatchers.IO) { FragmentApi(Prefs(ctx)).roomToken(name, operator) }
         if (tok == null) {
             _state.value = State(error = "接続できませんでした")
@@ -200,6 +201,10 @@ object CallAudio {
                 )
                 updateProximity(ctx)
             }
+            if (audible) {
+                start()
+                audioSwitchStarted = true
+            }
         }
         room = r
         roomName = name
@@ -207,15 +212,21 @@ object CallAudio {
         jobs += scope.launch { watch(r) }
         registerTranscripts(r)
         try {
-            // ⚠自動購読は切る。音を出すかどうかで購読を入れ切りする (setAudible)
-            r.connect(tok.url, tok.token, ConnectOptions(autoSubscribe = false))
+            // 音を出す状態で繋ぐときはサーバー側の自動購読も有効にする (発信時など後から参加した sip_ の取りこぼし防止)
+            r.connect(tok.url, tok.token, ConnectOptions(autoSubscribe = audible))
             if (operator) r.localParticipant.setMicrophoneEnabled(true)
-            _state.value = _state.value.copy(connected = true, operator = operator, muted = false, error = null)
-            Log.i(TAG, "connected room=$name operator=$operator")
+            _state.value = _state.value.copy(connected = true, operator = operator, audible = audible, muted = false, error = null)
+            Log.i(TAG, "connected room=$name operator=$operator audible=$audible")
         } catch (e: Exception) {
             Log.w(TAG, "connect failed", e)
             teardown()
             _state.value = State(error = "接続できませんでした")
+            scope.launch {
+                delay(800)
+                if (targetRoom == name && (holders.isNotEmpty() || wantOperator) && room == null) {
+                    reconcile()
+                }
+            }
             return
         }
         jobs += scope.launch { pollLevels(r) }
@@ -225,14 +236,32 @@ object CallAudio {
         jobs.forEach { it.cancel() }
         jobs.clear()
         room?.let {
+            if (audioSwitchStarted) {
+                runCatching { it.audioSwitchHandler?.stop() }
+            }
             runCatching { it.disconnect() }
             runCatching { it.release() }
         }
         room = null
         roomName = null
         roomOperator = false
+        audioSwitchStarted = false
         _levels.value = Levels()
         _interim.value = emptyList()
+    }
+
+    private fun syncRemoteAudioSubscriptions(r: Room, audible: Boolean) {
+        r.remoteParticipants.values.forEach { p ->
+            p.audioTrackPublications.forEach { (pub, _) ->
+                (pub as? RemoteTrackPublication)?.let {
+                    if (audible) {
+                        if (!it.subscribed) it.setSubscribed(true)
+                    } else {
+                        it.setSubscribed(false)
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -240,18 +269,24 @@ object CallAudio {
      * ⚠出さないのに AudioSwitch を握ったままだと、ロック画面の波形を出しただけで音楽が止まる
      */
     private fun setAudible(r: Room, audible: Boolean) {
-        r.remoteParticipants.values.forEach { p ->
-            p.audioTrackPublications.forEach { (pub, _) ->
-                (pub as? RemoteTrackPublication)?.let { if (it.subscribed != audible) it.setSubscribed(audible) }
-            }
-        }
+        syncRemoteAudioSubscriptions(r, audible)
         val h = r.audioSwitchHandler ?: return
-        if (audible) h.start() else h.stop()
+        if (audible && !audioSwitchStarted) {
+            h.start()
+            audioSwitchStarted = true
+        } else if (!audible && audioSwitchStarted) {
+            h.stop()
+            audioSwitchStarted = false
+        }
     }
 
     private suspend fun watch(r: Room) {
         r.events.events.collect { e ->
             when (e) {
+                // 新規参加者が既にトラックを持っている場合、SDK 内の非同期購読レースで TrackPublished が落ちることがあるため ParticipantConnected でも購読を合わせる
+                is RoomEvent.ParticipantConnected -> {
+                    if (_state.value.audible) syncRemoteAudioSubscriptions(r, true)
+                }
                 // 後から出てきた音声 (AI の声・相手の声) も、音を出しているなら拾う
                 is RoomEvent.TrackPublished -> {
                     val pub = e.publication as? RemoteTrackPublication
@@ -260,15 +295,36 @@ object CallAudio {
                 is RoomEvent.Disconnected -> {
                     Log.i(TAG, "disconnected: ${e.reason}")
                     _state.value = _state.value.copy(connected = false)
+                    val curName = roomName
+                    if (room === r && curName != null && targetRoom == curName && (holders.isNotEmpty() || wantOperator)) {
+                        scope.launch {
+                            delay(600)
+                            if (room === r && !_state.value.connected && targetRoom == curName) {
+                                mutex.withLock {
+                                    if (room === r && !_state.value.connected) {
+                                        teardown()
+                                        apply()
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                is RoomEvent.Reconnected -> _state.value = _state.value.copy(connected = true)
+                is RoomEvent.Reconnected -> {
+                    _state.value = _state.value.copy(connected = true)
+                    if (_state.value.audible) syncRemoteAudioSubscriptions(r, true)
+                }
                 else -> Unit
             }
         }
     }
 
     private suspend fun pollLevels(r: Room) {
+        var ticks = 0
         while (scope.isActive) {
+            if (++ticks % 20 == 0 && _state.value.audible) {
+                syncRemoteAudioSubscriptions(r, true)
+            }
             var caller = 0f
             var ai = 0f
             r.remoteParticipants.values.forEach { p ->

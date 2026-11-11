@@ -40,6 +40,7 @@ import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.Hearing
 import androidx.compose.material.icons.rounded.Lightbulb
 import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.MicOff
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.SmartToy
@@ -307,8 +308,8 @@ private fun StatusStrip(
     val otherTalkers = others.filter { it.role == "talk" }.map { it.name.ifEmpty { "端末" } }
     val watchers = others.filter { it.role == "watch" }.map { it.name.ifEmpty { "端末" } }
     val label = when {
-        operator && otherTalkers.isNotEmpty() -> "あなたと${otherTalkers.joinToString("・")}が会話中"
-        operator -> "あなたが会話中"
+        operator && otherTalkers.isNotEmpty() -> "あなたと${otherTalkers.joinToString("・")}が会話中" + if (audio.muted) " (ミュート)" else ""
+        operator -> if (audio.muted) "あなたが会話中 (ミュート)" else "あなたが会話中"
         handler == "human" -> "${otherTalkers.joinToString("・").ifEmpty { "本人" }}が応対中"
         handler == "hold" -> "保留中"
         handler == "connecting" -> "接続中"
@@ -339,7 +340,10 @@ private fun StatusStrip(
                 Modifier
                     .size(8.dp)
                     .clip(CircleShape)
-                    .background(if (myLevel > 0.04f) LocalSemantic.current.me else MaterialTheme.colorScheme.outlineVariant)
+                    .background(
+                        if (!audio.muted && myLevel > 0.04f) LocalSemantic.current.me
+                        else MaterialTheme.colorScheme.outlineVariant
+                    )
             )
         }
         Spacer(Modifier.weight(1f))
@@ -437,12 +441,21 @@ private fun Transcript(
     interim: List<CallAudio.Interim>,
     modifier: Modifier = Modifier,
 ) {
-    // ⚠確定済みの発話と同じ文の途中表示は出さない (DB に入った後も数秒残るため)
-    val done = segments.takeLast(6).map { it.text.trim() }.toSet()
+    // ⚠確定済みの発話と同じ文 (またはSTT音声補正後の文) の途中表示は出さない
+    val recentSegs = segments.takeLast(6)
+    val done = recentSegs.map { it.text.trim() }.toSet()
     val bubbles = segments.mapIndexed { i, s -> Bubble("s$i", s.speaker, s.text, false) } +
         pendingWhispers.mapIndexed { i, t -> Bubble("w$i", "whisper", t, true) } +
-        interim.filter { it.text.isNotBlank() && it.text.trim() !in done }
-            .map { Bubble("i${it.key}", it.speaker, it.text, true) }
+        interim.filter { im ->
+            val t = im.text.trim()
+            t.isNotBlank() && t !in done && !(im.final && recentSegs.any { s ->
+                s.speaker == im.speaker && run {
+                    val a = s.text.filterNot { it.isWhitespace() || it in "。、！？!?.," }
+                    val b = t.filterNot { it.isWhitespace() || it in "。、！？!?.," }
+                    a == b || (a.length >= 3 && b.length >= 3 && a.windowed(2).any { w -> w in b })
+                }
+            })
+        }.map { Bubble("i${it.key}", it.speaker, it.text, true) }
 
     val listState = rememberLazyListState()
     val last = bubbles.lastOrNull()
@@ -571,7 +584,7 @@ private fun WhisperBar(onSend: (String) -> Unit) {
 
 /**
  * 下の操作列 (2026-09-26 に 3 状態へ組み替え):
- *   会話中   … 出力先 / 保留 / AIに任せる / 終了
+ *   会話中   … 出力先 / ミュート / 保留 / AIに任せる / 終了
  *   保留中   … 呼ぶ / 話す / AIに任せる / 終了
  *   それ以外 … 出力先 / 話す / 終了
  */
@@ -593,7 +606,7 @@ private fun Controls(
     Row(
         Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 14.dp),
+            .padding(horizontal = 8.dp, vertical = 14.dp),
         horizontalArrangement = Arrangement.SpaceEvenly,
     ) {
         if (holding) {
@@ -638,6 +651,14 @@ private fun Controls(
             }
         }
         if (operator) {
+            ControlButton(
+                label = if (audio.muted) "ミュート中" else "ミュート",
+                icon = if (audio.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,
+                container = if (audio.muted) s.onSurface else s.surfaceContainerHigh,
+                content = if (audio.muted) s.surface else s.onSurface,
+                enabled = audio.connected,
+                onClick = { CallAudio.setMuted(!audio.muted) },
+            )
             ControlButton(
                 label = "保留",
                 icon = Icons.Rounded.Pause,
@@ -700,7 +721,7 @@ private fun ControlButton(
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
-            .width(76.dp)
+            .width(68.dp)
             .alpha(if (enabled) 1f else 0.38f),
     ) {
         Surface(
@@ -708,10 +729,10 @@ private fun ControlButton(
             enabled = enabled,
             shape = CircleShape,
             color = container,
-            modifier = Modifier.size(60.dp),
+            modifier = Modifier.size(56.dp),
         ) {
             Box(contentAlignment = Alignment.Center) {
-                Icon(icon, contentDescription = label, tint = content, modifier = Modifier.size(26.dp))
+                Icon(icon, contentDescription = label, tint = content, modifier = Modifier.size(24.dp))
             }
         }
         Spacer(Modifier.height(6.dp))
@@ -720,6 +741,7 @@ private fun ControlButton(
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }

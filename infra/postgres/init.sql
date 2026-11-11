@@ -132,6 +132,9 @@ ALTER TABLE calls ADD COLUMN IF NOT EXISTS caller_label text;
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS recording_path text;
 -- 通話で会話した人の名前 (2026-10-04)。agent が担い手の変わり目ごとに足す
 ALTER TABLE calls ADD COLUMN IF NOT EXISTS handled_by jsonb NOT NULL DEFAULT '[]'::jsonb;
+-- Cloud Run (HTTP モード) の世代トークン付きリースと生存確認 (2026-11-04)
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS agent_lease text;
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS agent_heartbeat_at timestamptz;
 
 -- ===== メンバー・招待・端末のログイン (2026-09-26) =====
 -- 説明は services/agent/members.py (hookd の起動時に同じ DDL を流す)。片方だけ直さないこと

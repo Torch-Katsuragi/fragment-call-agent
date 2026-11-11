@@ -19,6 +19,12 @@ export const LIVEKIT_HTTP_URL = LIVEKIT_WS_URL.replace(/^ws/, "http");
 // サーバ側と同じ値にしてはいけない — 自分の公開IP宛はGCPでヘアピンせず Room API が死ぬ
 export const LIVEKIT_PUBLIC_WS_URL = process.env.LIVEKIT_PUBLIC_URL ?? LIVEKIT_WS_URL;
 
+// 通話ルーム名のプレフィックス (services/agent の ROOM_PREFIX と一致させる)
+export const ROOM_PREFIX = process.env.ROOM_PREFIX || "call";
+export function ownsRoom(roomName: string): boolean {
+  return roomName.startsWith(`${ROOM_PREFIX}_`);
+}
+
 // 通話履歴DB (compose の postgres。127.0.0.1:5432 に公開されている)
 export const DATABASE_URL =
   process.env.DATABASE_URL ?? "postgresql://callagent:callagent@localhost:5432/callagent";
@@ -39,22 +45,7 @@ export type LineInfo = {
   configured: boolean;
 };
 
-// ⚠main 以外のテナント (2026-10-04、同居構成) はユーザー本人の回線を見せない。そのテナントの回線だけ
-//   (systemd のユニットで TENANT_LINE_NUMBER / TENANT_LINE_LABEL を渡す)
-const OTHER_TENANT = (process.env.TENANT_ID || "main") !== "main";
-
-export const LINES: LineInfo[] = OTHER_TENANT
-  ? [
-      {
-        id: "tenant",
-        label: process.env.TENANT_LINE_LABEL ?? "Twilio",
-        number: process.env.TENANT_LINE_NUMBER ?? "",
-        kind: "peer型 (非REGISTER)",
-        role: "代表番号 (受電・発信)",
-        configured: !!process.env.TENANT_LINE_NUMBER,
-      },
-    ]
-  : [
+export const LINES: LineInfo[] = [
   {
     id: "brastel",
     label: "ブラステル My050",

@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { acceptInvite, createDeviceSession, hashToken, verifyGoogleIdToken } from "@/lib/members";
+import { acceptInvite, createDeviceSession, verifyGoogleIdToken } from "@/lib/members";
 import { publicBase } from "@/lib/publicBase";
-import { TENANT_ID, forwardTo, tenantOfInvite } from "@/lib/tenants";
 
 export const dynamic = "force-dynamic";
 
@@ -15,11 +14,6 @@ export async function POST(req: NextRequest) {
   const deviceId = typeof body?.device_id === "string" ? body.device_id : "";
   if (!invite || !idToken || !/^[A-Za-z0-9-]{8,64}$/.test(deviceId)) {
     return NextResponse.json({ error: "入力が足りません" }, { status: 400 });
-  }
-  // 同居構成 (2026-10-04): 招待が他のテナントのものなら、そのテナントの管制室に渡す
-  if (!req.headers.get("x-forwarded-tenant-hop")) {
-    const owner = await tenantOfInvite(hashToken(invite));
-    if (owner && owner.id !== TENANT_ID) return forwardTo(owner, "/api/device/join", body);
   }
   const g = await verifyGoogleIdToken(idToken);
   if (!g) return NextResponse.json({ error: "Google アカウントを確かめられませんでした" }, { status: 401 });

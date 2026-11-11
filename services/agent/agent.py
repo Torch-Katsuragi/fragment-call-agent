@@ -30,20 +30,13 @@ import os
 import re
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from itertools import count
-from pathlib import Path
 
-import asyncpg
-from google.cloud import texttospeech as gcloud_texttospeech
-from google.genai import types as genai_types
-from livekit import api as lk_api
 from livekit import rtc
 from livekit.agents import (
     Agent,
-    AgentSession,
     AudioConfig,
-    BackgroundAudioPlayer,
     AutoSubscribe,
+    BackgroundAudioPlayer,
     ConversationItemAddedEvent,
     JobContext,
     RunContext,
@@ -52,29 +45,48 @@ from livekit.agents import (
     function_tool,
 )
 from livekit.agents import metrics as lk_metrics
-from livekit.agents import stt as lk_stt
-from livekit.agents.voice.room_io import RoomInputOptions
 from livekit.agents.llm import ChatMessage
-from livekit.plugins import deepgram, google, silero
-from livekit.plugins.google.realtime import realtime_api as _google_realtime
+from livekit.agents.voice.room_io import RoomInputOptions
 
-# ⚠プラグインのモデル名の照合を外す (2026-10-08)。プラグインは gemini-3.8-live を「Gemini API 専用」と
-#   決め打ちで持っていて vertexai=True だと止めるが、Vertex AI (us-central1) でも実際に動く (音声が返るのを実測)。
-#   照合は名前の一覧との完全一致だけで、他の振る舞いには関わらない
-_google_realtime._validate_model_api_match = lambda model, use_vertexai: None
-
-import security
-import tenants as tenant_registry
-import vertex
-from aivis_tts import DEFAULT_MODEL_UUID as AIVIS_DEFAULT_MODEL
-from aivis_tts import AivisTTS
-from livekit.agents import tts as tts_mod
-from voicevox_tts import VoicevoxTTS
+from call_db import CallDb, TranscriptWriter, _safe_delete_room, safe_delete_room
+from http_server import HttpCallCtx, run_http_server
+from media_pipeline import (
+    CONNECT_GRACE_SEC,
+    HOLD_MUSIC,
+    HOLD_TIMEOUT_LINE,
+    HOLD_TIMEOUT_SEC,
+    LEAVE_SETTLE_SEC,
+    SILENCE_SEC,
+    TAKEOVER_LINE,
+    TTS_CHOICES,
+    _hold_music_loop,
+    _load_hold_music,
+    _make_google_tts,
+    _make_live_vad,
+    _make_one_tts,
+    _make_session,
+    _make_stt,
+    _make_tts,
+)
+from stt_refine import (
+    CallSttTracker,
+    _get_refine_client,
+    _pcm16k_to_wav,
+    _refine_transcript_with_audio,
+    transcribe_operator_track,
+    watch_caller_track,
+)
+from workspace_config import (
+    PROMPT_SECTIONS,
+    PROMPTS_DIR,
+    load_prompt_section,
+    load_workspace_prompts,
+    strip_frontmatter,
+    urgent_allowed,
+)
+from workspace_config import urgent_allowed as _urgent_allowed
 
 logger = logging.getLogger("call-agent")
-
-TRANSCRIPT_DIR = Path(os.environ.get("TRANSCRIPT_DIR", "/data/transcripts"))
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # ユーザー編集可能なシステムプロンプトは M4 以降 (DESIGN §5.3)。M2 は固定文で検証する。
 JST = timezone(timedelta(hours=9))
@@ -87,51 +99,7 @@ def _now_jst_str() -> str:
 
 # 方針: モデルに自分の状況を正直に伝える (2026-07-16 実機テストで「存在しない取り次ぎを
 # 約束して黙り込む」症状 → 状況を隠さず説明する方が誤った約束をしなくなる)
-# ===== 編集可能なプロンプトのセクション (2026-07-30に外出し) =====
-# なぜ外に出したか: 口調・態度・「誰に何を教えるか」は「実機で聞いてみて直す」ものなので、
-# 直すたびにコンテナを再ビルドするのは重すぎた (この日だけで人格の調整が4回入った)。
-# mdでワークスペース(=Google Drive)に置けば、管制室の設定画面からもObsidianからも直せる。
-#
-# セクションに切って**合成**する形にした理由 (ユーザーの案):
-#   「個人情報の扱い」と「人格・態度」は別の関心事で、直す動機も頻度も違う。
-#   1枚の巨大プロンプトだと、口調を直したいだけのときに開示ルールまで目に入って事故る。
-# ⚠**開示ルールも編集できる**。当初これをコードに固定したが、「誰に何を教えるか」は
-#   運用する本人が調整したい部分なので誤りだった (ユーザーの指摘で撤回)。
-#   代わりに、消したら落ちる項目は自動テストで見る (run_scenarios.py の no_owner_name 等)。
-#
-# 「あなたの状況」「あなたの目的」「応対のしかた」は仕組みの説明とツールの使い方なので固定。
-PROMPTS_DIR = Path(__file__).parent / "prompts"
-
-# key: {既定ファイル, ワークスペース上のファイル名, 差し込み先}
-# ⚠ダッシュボード側 (app/api/prompts/route.ts) と揃えること。ズレると編集先が食い違う
-PROMPT_SECTIONS: dict[str, dict[str, str]] = {
-    "disclosure": {
-        "title": "情報の扱い (開示ルール)",
-        "default": "disclosure.md",
-        "workspace": "設定/情報の扱い.md",
-    },
-    "persona": {
-        "title": "人格と態度 (話し方・温度感)",
-        "default": "persona.md",
-        "workspace": "設定/人格と態度.md",
-    },
-    # ⚠これだけ性質が違う: 「設定」ではなく**頻繁に変わる状態**。
-    #   判断には使うが相手には明かさない (非対称)。更新を忘れると嘘になるので、
-    #   読み込み時に最終更新日時を添えてモデルに渡す (下の load_prompt_section 参照)
-    "owner_status": {
-        "title": "本人の今の状況 (相手には明かさない)",
-        "default": "owner_status.md",
-        "workspace": "設定/本人の今の状況.md",
-    },
-}
-
-
 OWNER_NAME = os.environ.get("OWNER_NAME", "").strip()
-
-# 無言検知のしきい値 (2026-07-31)。電話で5秒の沈黙は長い — 相手が黙ったら一度促し、
-# それでも黙っていたら切る。⚠1回で切らないのは、電波が悪いだけの人や機械が苦手で
-# 言葉に詰まる人を切ってしまうため
-SILENCE_SEC = float(os.environ.get("SILENCE_SEC") or "5")
 
 
 # ⚠**テキストの機械置換はしない** (2026-07-31にユーザーの方針で撤去)。
@@ -145,87 +113,28 @@ SILENCE_SEC = float(os.environ.get("SILENCE_SEC") or "5")
 #     承知のうえで受け入れている (「ある程度は仕方ない」— ユーザー)。
 #     すり抜けは run_scenarios.py の no_owner_name が警報として拾う
 
-def _urgent_allowed(number: str) -> bool:
-    """この相手は緊急呼び出し (本人の携帯を鳴らすこと) を許可されているか。
-    実体はワークスペースの電話帳md `連絡先/<番号>.md` の `緊急呼び出し` プロパティで、
-    **本人が管制室で承認したときだけ** true になる。
-
-    ⚠番号や名乗りから推測してはいけない。日本では発信者番号の偽装が現在進行形の主要手口で、
-      警察庁が「表示された番号を信用するな」と公式に注意喚起している (末尾0110の警察署番号を
-      騙る詐欺・被害100億円超)。着信側で検証する基盤が日本には無いので、
-      信用できるのは本人の明示的な承認だけ。⚠非通知・+始まりは常に不許可
-      (キャリアが偽装を潰した結果がその形なので、むしろ疑わしい印)。
-    """
-    if not re.fullmatch(r"[0-9]{4,20}", number or ""):
-        return False
-    ws = os.environ.get("FRAGMENT_WORKSPACE", "")
-    if not ws:
-        return False
-    # 2026-09-26 から 連絡先/<番号>/<番号>.md。移し替えの途中でも効くよう旧形式も見る
-    book = Path(ws) / "連絡先"
-    text = None
-    for p in (book / number / f"{number}.md", book / f"{number}.md"):
-        try:
-            text = p.read_text(encoding="utf-8")
-            break
-        except Exception:
-            continue
-    if text is None:
-        return False
-    m = re.search(r"^緊急呼び出し:\s*(\S+)\s*$", text, re.M)
-    return bool(m) and m.group(1).strip().lower() in ("true", "yes", "はい")
-
-
-def load_prompt_section(key: str) -> str:
-    """プロンプトのセクションを読む。ワークスペースにあればそれ、無ければリポジトリの既定。
-    通話ごとに読むので、mdを直せば次の通話から効く (再起動不要)。"""
-    spec = PROMPT_SECTIONS[key]
-    ws = os.environ.get("FRAGMENT_WORKSPACE", "")
-    if ws:
-        p = Path(ws) / spec["workspace"]
-        try:
-            if p.is_file():
-                text = p.read_text(encoding="utf-8").strip()
-                if text:
-                    # ⚠「本人の今の状況」は放置されると嘘になる (「会議中」のまま1週間、など)。
-                    #   最終更新を添えると、モデルが現在日時と見比べて古さを割り引ける
-                    if key == "owner_status":
-                        at = datetime.fromtimestamp(p.stat().st_mtime, JST)
-                        text += (
-                            f"\n\n(この状況が最後に更新されたのは {at:%Y-%m-%d %H:%M} です。"
-                            "現在日時と離れているほど古い情報として扱い、"
-                            "古ければ状況を当てにせず、通常どおり用件を預かること)"
-                        )
-                    return text
-                logger.warning("プロンプト %s が空 (%s) — 既定を使う", key, p)
-        except Exception:
-            logger.exception("プロンプト %s を読めない (%s) — 既定を使う", key, p)
-    try:
-        return (PROMPTS_DIR / spec["default"]).read_text(encoding="utf-8").strip()
-    except Exception:
-        logger.exception("既定のプロンプト %s も読めない — このセクション無しで続行", key)
-        return ""
-
 
 # この電話の名乗り (2026-09-30、管制室の設定 self_label。個人なら苗字「山田」、組織なら組織名)。
 # 空 = 名乗らない。⚠「〇〇の携帯」とは書かない — 固定電話にも使う (ユーザー指摘)
 # STAFF = 名前を出してよい人 (苗字と役職、settings.staff の JSON)。
-# どちらも通話ごとに entrypoint が settings から読んで入れる (1 通話 = 1 プロセス)
+# プロセス再利用 (Cloud Run HTTP モード) でも通話間で混ざらないよう引数渡しを基本とする
 SELF_LABEL = ""
 STAFF: list[dict] = []
 
 
-def _self_label_rules() -> str:
+def _self_label_rules(self_label: str | None = None, staff: list[dict] | None = None) -> str:
+    lbl = self_label if self_label is not None else SELF_LABEL
+    stf = staff if staff is not None else STAFF
     out = ""
-    if SELF_LABEL:
+    if lbl:
         out += f"""
 # 名乗り
-この電話の名乗りは「{SELF_LABEL}」。最初の挨拶で名乗っている。どちらにおかけか聞かれたら
-「{SELF_LABEL}でございます」と答えてよい。
+この電話の名乗りは「{lbl}」。最初の挨拶で名乗っている。どちらにおかけか聞かれたら
+「{lbl}でございます」と答えてよい。
 """
-    if STAFF:
+    if stf:
         lines = "\n".join(
-            f"- {s['surname']}" + (f" ({s['title']})" if s.get("title") else "") for s in STAFF
+            f"- {s['surname']}" + (f" ({s['title']})" if s.get("title") else "") for s in stf
         )
         out += f"""
 # 名前を出してよい人 (苗字と役職)
@@ -240,7 +149,13 @@ def _self_label_rules() -> str:
     return out
 
 
-def build_instructions(caller: str | None) -> str:
+def build_instructions(
+    caller: str | None,
+    *,
+    self_label: str | None = None,
+    staff: list[dict] | None = None,
+    prompt_overrides: dict[str, str] | None = None,
+) -> str:
     if caller:
         # ⚠番号の実桁はプロンプトに入れない (2026-08-01)。「言わせないために書いた文字列が
         #   供給源になる」漏洩を3回踏んだのと同じ構図で、桁が無ければ読み上げようがない。
@@ -264,18 +179,16 @@ def build_instructions(caller: str | None) -> str:
     #     「省略」であるため (IFScale)。重複は本製品では漏洩面の拡大という実コストも持つ
     #   ・開示ルールを前方へ (前方バイアス: 前半のルールほど守られる)
     #   ・否定形は可能な限り肯定形へ (ピンクの象問題)。禁止対象の実例は書かない
-    s_disclosure = load_prompt_section("disclosure")
-    s_persona = load_prompt_section("persona")
+    s_disclosure = load_prompt_section("disclosure", prompt_overrides)
+    s_persona = load_prompt_section("persona", prompt_overrides)
     return f"""\
 あなたは、この電話の持ち主に代わって着信へ出るAIアシスタントです。
 あなたは日本語だけで話します。相手も日本語で話しています。電話の音はこもり、方言もあるので、
 外国語に聞こえたらそれは聞き違いです — 日本語で「恐れ入ります、もう一度お願いできますか」と聞き返す。
-立ち位置は「インタラクティブな留守電」— 用件を預かるのが仕事で、相槌と短い聞き返しが
-できる点だけが普通の留守電と違う。AIが先に用件を伺う係であることは、聞かれたら
-正直に答えてよい (プロダクト名は名乗らない)。
+あなたの役割は、持ち主に代わって相手の話を聞き、伝言や要件を預かって持ち主に引き継ぐことです (プロダクト名は名乗らない)。
 
 {s_disclosure}
-{_self_label_rules()}
+{_self_label_rules(self_label, staff)}
 # ツール (あなたにできる操作はこの3つだけ)
 - search_past_calls: この発信者との過去の通話を検索する。「前回の件」など過去の話が
   前提になったら使う。即答なので無言で使ってよい
@@ -299,26 +212,11 @@ def build_instructions(caller: str | None) -> str:
 これ以外の操作 (転送・保留・調べもの) は、あなたの手元にはない。
 だから「少々お待ちください」とは言わない — 待たせても、あなたの側で進むことは何も無い。
 
-# 締めるまでの流れ
-1. 相手が話し終えるまで聞く。名乗りの途中・話の途中で締めない
-2. 用件の中身を聞き取る。相談や困りごとなら、何が起きているか・いつからか・何を試したかを
-   1つずつ短く聞く (2〜3問まで)。持ち主が折り返したとき、すぐ動けるように
-3. 「ほかにお伝えすることはございますか」と一度だけ聞く
-4. 相手が「以上」「それだけ」と言ったら、締めの挨拶と end_call
-- 相手が「もういい」「切ります」と言ったら、いつでもすぐ締めて end_call を呼ぶ
-
-# 目的
-- ゴールは用件を「聞き出して」記録に残すこと。解決は持ち主の仕事 — 記録を読み、
-  準備して折り返す。取るのは3つ: **誰が / 何の用件で / どうしてほしいか**
-- 話のイニシアチブは相手に握らせる。言いたいことを言わせる過程で自然に引き出す
-- **あなたは約束をしない**。あなたの約束は、持ち主が守る羽目になる。口にしてよいのは
-  事実だけ:「承りました」「お伝えしておきます」。折り返しや期限は、相手が希望した時に
-  「ご希望としてお伝えしておきます」と希望のまま預かる (こちらから持ちかけない)
-- 事前情報・【後方支援メモ】・過去の記録は参考情報。今の用件と同じと決めつけず、
-  迷ったら相手に短く確認する。そこに無いことは知らないことなので、調べる素振りをせず
-  「分かりかねますので、お伝えして確認いたします」と預かる (その場で調べるわけではない)
-- 相手が困っていたら、まず気持ちを受け止める (「それはお困りですね」)。
-  直し方や答えをあなたが言う必要はない — 「詳しく伺って、お伝えしますね」と聞く方へ進む
+# 応対の原則
+- 話の主導権は相手に任せ、相手が話したいことを自然に話せるように聞く。
+- 自分では約束や判断をしない。「承りました」「お伝えしておきます」と事実だけを伝え、折り返しや期限を相手が希望したときは「ご希望としてお伝えしておきます」と預かる (こちらから折り返しを提案しない)。
+- 事前情報・【後方支援メモ】・過去の記録に無いことは知らないことなので、「分かりかねますので、お伝えして確認いたします」と預かる。
+- 相手の話が一通り終わって一区切りついたときだけ、他に伝えておくことがないか確認し、「確かにお伝えしておきます。失礼いたします」と挨拶して end_call を呼ぶ (話の途中ややり取りの最中に急いで締めようとしない)。相手が「もういい」「切ります」と言ったらいつでもすぐ締めて end_call を呼ぶ。
 
 {s_persona}
 
@@ -330,6 +228,7 @@ def build_instructions(caller: str | None) -> str:
 - あなたが聞き取った内容は、すべて文字起こしとして正確に持ち主へ届く。
   だから復唱・読み上げには確認の意味がない — 受け止めて、次へ進む
 """
+
 
 # ⚠短さが要件 (2026-07-30の実機テストで判明)。予告なしの相手 (ユーザーの家族) にかけさせたら、
 # 挨拶に被せて話し続けたためAIが一言も言えないまま終わった。対策として割り込みを無効にするが、
@@ -346,10 +245,12 @@ def build_instructions(caller: str | None) -> str:
 GREETING = "はい、AIが代わりに出ます。"
 
 
-def greeting() -> str:
+def greeting(self_label: str | None = None) -> str:
     """名乗りがあれば頭に付ける (2026-09-30 ユーザー「AIが出たら相手はまず戸惑う」)。
     ⚠挨拶は割り込み無効で流すので長さが効く。名乗りは短く"""
-    return f"はい、{SELF_LABEL}です。AIが代わりに出ます。" if SELF_LABEL else GREETING
+    lbl = self_label if self_label is not None else SELF_LABEL
+    return f"はい、{lbl}です。AIが代わりに出ます。" if lbl else GREETING
+
 
 # 締めの挨拶 (発話の終わりが「失礼いたします」)。言ったのに end_call が無ければこちらで切る (_hangup_after_goodbye)。
 # ⚠文末だけを見る — 「失礼いたしました」(謝罪) や途中の「失礼ですが」で切らない
@@ -359,8 +260,6 @@ GOODBYE_GRACE_SEC = float(os.environ.get("GOODBYE_GRACE_SEC") or "2.5")
 _FAREWELL_WORDS = re.compile(
     r"失礼|ありがと|おおきに|大きに|よろしく|宜しく|頼む|頼みます|お願い|ほな|さいなら|さようなら|バイバイ|どうも|はい|ええ|うん"
 )
-
-
 _NOT_DONE = re.compile(r"待って|まって|あと|もう一つ|もうひとつ|それと|ちょっと|すみません|あの")
 
 
@@ -372,44 +271,6 @@ def _is_farewell(text: str) -> bool:
         return True  # 「はい」「ほな」「おなす」(聞き取り崩れ) など
     return len(t) <= 25 and bool(_FAREWELL_WORDS.search(t))
 
-# ===== 保留 (2026-09-26、presence.py) =====
-# 会話中の端末が 0 台で AI 応答がオフ = 保留。保留音を流し、長引いたら AI が引き取る —
-# 会話中の端末が電池切れ・圏外で消えても、相手を保留音のまま放置しない
-HOLD_TIMEOUT_SEC = float(os.environ.get("HOLD_TIMEOUT_SEC") or "60")
-# 本人が受けた通話・発信で、本人の端末がルームに入ってくるまでの猶予。過ぎたら保留として扱う
-CONNECT_GRACE_SEC = 15.0
-# 会話中の最後の 1 人が抜けてから保留と見なすまでの間。「AIに任せる」は AI 応答のオンと
-# 退室が別々に届くので、順番が前後すると一瞬だけ保留音が鳴る
-LEAVE_SETTLE_SEC = 1.2
-HOLD_MUSIC = str(Path(__file__).with_name("assets") / "hold.wav")
-HOLD_TIMEOUT_LINE = "大変お待たせしております。担当の者がつかまりませんので、AIが代わりにご用件を伺います。"
-# まだ名乗っていない通話 (本人が受けた通話) に AI が入るときの一言。AI であることは必ず言う
-TAKEOVER_LINE = "ここからはAIが代わってお話を伺います。"
-
-_hold_frames: list[rtc.AudioFrame] = []
-
-
-async def _load_hold_music() -> list[rtc.AudioFrame]:
-    """保留音をメモリに展開する (プロセスで 1 回)。
-
-    ⚠ファイルのまま BackgroundAudioPlayer に渡すと**無音になる** (2026-09-26 に VM で実測、RMS 0)。
-    ミキサーは 1 フレームを 200ms しか待たず、待ちきれないと __anext__ を cancel する。2 コアの VM では
-    ファイルの読み始めがそれより遅く、cancel でジェネレータごと閉じて、以後は無音を混ぜ続けていた。
-    展開済みのフレームを配るだけなら待たせない
-    """
-    if not _hold_frames:
-        from livekit.agents.utils.audio import audio_frames_from_file
-
-        async for f in audio_frames_from_file(HOLD_MUSIC, sample_rate=48000, num_channels=1):
-            _hold_frames.append(f)
-    return _hold_frames
-
-
-async def _hold_music_loop():
-    frames = await _load_hold_music()
-    while True:
-        for f in frames:
-            yield f
 
 # 関数呼び出しが本文に溢れた印。⚠2026-08-01に gemini-3.6-flash で実測した実際の文字列から。
 # 表記が毎回違う (`#CALL:` `[call:` `<call:` `Address:` の前置き、BOMやデーヴァナーガリーの混入) ので、
@@ -418,376 +279,42 @@ async def _hold_music_loop():
 TOOL_LEAK = re.compile(r"default_api:|end_call\s*\{|request_handoff\s*\{|<call:|#CALL:")
 
 
-class TranscriptWriter:
-    """生ログのJSONLバックアップ。通話1件 = 1ファイル、発信者番号ごとのディレクトリ。"""
-
-    def __init__(self, room_name: str, caller: str | None):
-        started = datetime.now(timezone.utc)
-        safe_caller = re.sub(r"[^0-9A-Za-z+]", "_", caller or "unknown")
-        d = TRANSCRIPT_DIR / safe_caller
-        d.mkdir(parents=True, exist_ok=True)
-        safe_room = re.sub(r"[^0-9A-Za-z_-]", "_", room_name)
-        self.path = d / f"{started.strftime('%Y%m%dT%H%M%SZ')}_{safe_room}.jsonl"
-        self._write(
-            {
-                "type": "meta",
-                "event": "call_start",
-                "room": room_name,
-                "caller": caller,
-                "at": started.isoformat(),
-            }
-        )
-        logger.info("transcript -> %s", self.path)
-
-    def _write(self, obj: dict) -> None:
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
-    def add_segment(self, speaker: str, text: str, interrupted: bool = False) -> None:
-        self._write(
-            {
-                "type": "segment",
-                "speaker": speaker,  # caller(=発信者) / ai
-                "text": text,
-                "interrupted": interrupted,
-                "at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-
-    def close(self) -> None:
-        self._write(
-            {"type": "meta", "event": "call_end", "at": datetime.now(timezone.utc).isoformat()}
-        )
-
-
-class CallDb:
-    """通話履歴DB (PostgreSQL)。スキーマは infra/postgres/init.sql。
-    DB障害で通話を落とさないよう、全操作はエラーを握りつぶしてログに残すだけにする。"""
-
-    def __init__(self):
-        self._pool: asyncpg.Pool | None = None
-        self._listen_conn: asyncpg.Connection | None = None
-        self.call_id = None
-        self._seq = count(1)
-
-    async def start_call(self, room: str, caller: str | None) -> None:
-        try:
-            self._pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
-            row = await self._pool.fetchrow(
-                """INSERT INTO calls (room_name, caller_number)
-                   VALUES ($1, $2)
-                   ON CONFLICT (room_name) DO UPDATE SET caller_number = EXCLUDED.caller_number
-                   RETURNING id""",
-                room,
-                caller,
-            )
-            self.call_id = row["id"]
-            logger.info("call row created: %s", self.call_id)
-        except Exception:
-            logger.exception("CallDb.start_call failed (通話は継続)")
-
-    async def update_caller(self, caller: str) -> None:
-        if not self._pool or self.call_id is None:
-            return
-        try:
-            await self._pool.execute(
-                "UPDATE calls SET caller_number = $2 WHERE id = $1", self.call_id, caller
-            )
-        except Exception:
-            logger.exception("CallDb.update_caller failed")
-
-    async def add_segment(self, speaker: str, text: str, interrupted: bool) -> None:
-        if not self._pool or self.call_id is None:
-            return
-        try:
-            await self._pool.execute(
-                """INSERT INTO transcript_segments (call_id, seq, speaker, text, interrupted)
-                   VALUES ($1, $2, $3, $4, $5)""",
-                self.call_id,
-                next(self._seq),
-                speaker,
-                text,
-                interrupted,
-            )
-        except Exception:
-            logger.exception("CallDb.add_segment failed")
-
-    async def search(self, caller: str | None, query: str) -> list[str]:
-        if not self._pool:
-            return []
-        rows = await self._pool.fetch(
-            """SELECT c.started_at, ts.speaker, ts.text
-               FROM transcript_segments ts JOIN calls c ON c.id = ts.call_id
-               WHERE ts.text ILIKE '%' || $1 || '%'
-                 AND ($2::text IS NULL OR c.caller_number = $2)
-                 AND c.id <> $3
-               ORDER BY ts.at DESC LIMIT 10""",
-            query,
-            caller,
-            self.call_id,
-        )
-        return [
-            f"[{r['started_at']:%Y-%m-%d %H:%M}] {r['speaker']}: {r['text']}"
-            for r in reversed(rows)
-        ]
-
-    async def create_job(self, kind: str, query: str) -> int | None:
-        """Directory Agent (別プロセスのworker) へのジョブ投入。"""
-        if not self._pool:
-            return None
-        row = await self._pool.fetchrow(
-            "INSERT INTO agent_jobs (call_id, kind, query) VALUES ($1, $2, $3) RETURNING id",
-            self.call_id,
-            kind,
-            query,
-        )
-        return row["id"]
-
-    async def get_job(self, job_id: int) -> tuple[str, str | None]:
-        row = await self._pool.fetchrow(
-            "SELECT status, result FROM agent_jobs WHERE id = $1", job_id
-        )
-        return (row["status"], row["result"]) if row else ("error", None)
-
-    async def find_done_job(self, query: str) -> str | None:
-        """同一通話内で同じ質問が完了済みならその結果を返す (タイムアウト後の再問い合わせ用)。"""
-        if not self._pool or self.call_id is None:
-            return None
-        row = await self._pool.fetchrow(
-            """SELECT result FROM agent_jobs
-               WHERE call_id = $1 AND query = $2 AND status = 'done'
-               ORDER BY id DESC LIMIT 1""",
-            self.call_id,
-            query,
-        )
-        return row["result"] if row else None
-
-    async def find_recent_done_job(self, query: str) -> str | None:
-        """直近3分以内の完了済みジョブを call_id 不問で探す。
-
-        着信フック (hookd) 経由の下調べジョブは INVITE 時点で投入されるため
-        call_id を持たない — 入室後のagentはこれで拾う。"""
-        if not self._pool:
-            return None
-        row = await self._pool.fetchrow(
-            """SELECT result FROM agent_jobs
-               WHERE query = $1 AND status = 'done'
-                 AND finished_at > now() - interval '3 minutes'
-               ORDER BY id DESC LIMIT 1""",
-            query,
-        )
-        return row["result"] if row else None
-
-    async def fetch_new_whispers(self, after_id: int) -> list:
-        """管制室が会話ストリーム (transcript_segments) に直接挿入した耳打ちの新着。
-        会話ストリームがバス — ダッシュボードが書き、UI/watcher/アシスタントが購読する。"""
-        if not self._pool or self.call_id is None:
-            return []
-        return await self._pool.fetch(
-            """SELECT id, text FROM transcript_segments
-               WHERE call_id = $1 AND speaker = 'whisper' AND id > $2 ORDER BY id""",
-            self.call_id,
-            after_id,
-        )
-
-    async def listen_push(self, on_push) -> None:
-        """agent_push チャネルの LISTEN (payload = call_id)。耳打ち・後方支援メモを
-        NOTIFY で即時配達する — 2秒ポーリングの待ちを潰す (ポーリングは保険で継続)。
-        LISTEN はコネクション単位なので専用の直結コネクションを1本持つ。"""
-        if self.call_id is None:
-            return
-        try:
-            self._listen_conn = await asyncpg.connect(DATABASE_URL)
-
-            def _notified(conn, pid, channel, payload):
-                if payload == str(self.call_id):
-                    on_push()
-
-            await self._listen_conn.add_listener("agent_push", _notified)
-        except Exception:
-            logger.exception("listen_push failed (2秒ポーリングで動作継続)")
-
-    async def set_ai_on(self, on: bool) -> None:
-        if self.call_id is None or not self._pool:
-            return
-        try:
-            await self._pool.execute("UPDATE calls SET ai_on = $2 WHERE id = $1", self.call_id, on)
-        except Exception:
-            logger.exception("ai_on の記録に失敗")
-
-    async def get_ai_on(self) -> bool | None:
-        """端末が切り替えた AI 応答 (/api/calls/<id>/ai)。読めなければ None"""
-        if self.call_id is None or not self._pool:
-            return None
-        try:
-            return await self._pool.fetchval("SELECT ai_on FROM calls WHERE id = $1", self.call_id)
-        except Exception:
-            return None
-
-    async def set_handler(self, handler: str, presence: list[dict]) -> None:
-        """担い手と参加者を端末に見せる。hold_since は保留に入った時刻 (保留が続く間は据え置き)"""
-        if self.call_id is None or not self._pool:
-            return
-        # 会話した人の名前を通話の記録に足していく (2026-10-04)。presence は終話で空にするので、
-        # これが無いと「誰が出たか」が後から分からなかった (履歴では人の発話が全部「本人」だった)
-        talkers = [p["name"] for p in presence if p.get("role") == "talk" and p.get("name")]
-        try:
-            await self._pool.execute(
-                """UPDATE calls SET handler = $2, presence = $3::jsonb,
-                     hold_since = CASE WHEN $2 = 'hold' THEN COALESCE(hold_since, now()) END,
-                     handled_by = (SELECT coalesce(jsonb_agg(DISTINCT v), '[]'::jsonb) FROM (
-                       SELECT jsonb_array_elements_text(coalesce(handled_by, '[]'::jsonb)) AS v
-                       UNION SELECT unnest($4::text[])) x)
-                   WHERE id = $1""",
-                self.call_id, handler, json.dumps(presence, ensure_ascii=False), talkers,
-            )
-        except Exception:
-            logger.exception("担い手の記録に失敗")
-
-    async def outbound_intent(self, number: str) -> bool:
-        """発信の印 (hookd /dial が置く)。この番号への直近の発信通話ならTrue (2026-07-19)。"""
-        if not self._pool:
-            return False
-        try:
-            row = await self._pool.fetchrow(
-                """SELECT 1 FROM agent_jobs
-                   WHERE kind = 'outbound_call' AND query = $1
-                     AND created_at > now() - interval '3 minutes' LIMIT 1""",
-                number,
-            )
-            return row is not None
-        except Exception:
-            logger.exception("CallDb.outbound_intent failed")
-            return False
-
-    async def mark_outbound(self, callee: str) -> None:
-        if not self._pool or self.call_id is None:
-            return
-        try:
-            await self._pool.execute(
-                """UPDATE calls SET direction = 'outbound', callee_number = $2,
-                       answered_by = 'human' WHERE id = $1""",
-                self.call_id,
-                callee,
-            )
-        except Exception:
-            logger.exception("CallDb.mark_outbound failed")
-
-    async def assistant_enabled(self) -> bool:
-        """留守電トグル。false でも通話がスタックを通る限り書記 (文字起こし+吹き出し) は動く —
-        このフラグが制御するのは「AIが喋るかどうか」だけ (支援機能とは独立、2026-07-18設計)。"""
-        if not self._pool:
-            return True
-        row = await self._pool.fetchrow(
-            "SELECT value FROM settings WHERE key = 'assistant_enabled'"
-        )
-        return row is None or row["value"] != "false"
-
-    async def setting(self, key: str) -> str:
-        """settings の 1 行。無い・読めないときは空文字"""
-        if not self._pool:
-            return ""
-        try:
-            v = await self._pool.fetchval("SELECT value FROM settings WHERE key = $1", key)
-            return (v or "").strip()
-        except Exception:
-            logger.exception("CallDb.setting(%s) failed", key)
-            return ""
-
-    async def tts_providers(self) -> tuple[str | None, str | None]:
-        """管制室の設定画面で選べる声の「メイン / サブ」。settings テーブルから読む。
-        通話ごとに読むので、切り替えは**次の通話から**効く (コンテナ再起動は不要)。
-        行が無ければ (None, None) を返し、呼び出し側が環境変数の既定にフォールバックする —
-        既存DBにマイグレーションを当てなくても動くようにするため。"""
-        if not self._pool:
-            return None, None
-        try:
-            rows = await self._pool.fetch(
-                "SELECT key, value FROM settings WHERE key IN ('tts_primary', 'tts_fallback')"
-            )
-            got = {r["key"]: (r["value"] or "").strip() for r in rows}
-            return got.get("tts_primary") or None, got.get("tts_fallback") or None
-        except Exception:
-            logger.exception("CallDb.tts_providers failed — 環境変数の既定を使う")
-            return None, None
-
-    async def fetch_new_notes(self, after_id: int) -> list:
-        """後方支援メモ (workerが会話を監視して自発的に投入する agent_note) の新着を取る。"""
-        if not self._pool or self.call_id is None:
-            return []
-        return await self._pool.fetch(
-            """SELECT id, result FROM agent_jobs
-               WHERE call_id = $1 AND kind = 'agent_note' AND status = 'done' AND id > $2
-               ORDER BY id""",
-            self.call_id,
-            after_id,
-        )
-
-    async def security_check(self, caller: str | None, callee: str | None):
-        """SIP不正利用の判定 (security.py)。Asterisk経由なら hookd /guard で既に落ちている —
-        ここに来るのは**FWやtrunkのallowed_addressesをすり抜けて直接LiveKitに入った呼**で、
-        2026-07-26に実際に起きた経路。判定はセッション生成前なのでSTT/TTS/LLMは1トークンも使わない。
-        DB不調時は None を返す = 通話を通す (警備が着信を止める方が損害が大きい)。"""
-        if not self._pool:
-            return None
-        try:
-            await security.ensure_schema(self._pool)
-            return await security.evaluate(self._pool, caller, callee, source="agent")
-        except Exception:
-            logger.exception("security_check failed (通話は継続 — fail-open)")
-            return None
-
-    async def drop_blocked_call(self) -> None:
-        """ブロックした呼の通話行を消す。証跡は security_events / call_attempts が持つので、
-        履歴・電話帳・通話記録mdを攻撃で汚さない (2026-07-26は108件の手作業掃除が発生した)。"""
-        if not self._pool or self.call_id is None:
-            return
-        try:
-            await self._pool.execute("DELETE FROM calls WHERE id = $1", self.call_id)
-            self.call_id = None
-        except Exception:
-            logger.exception("CallDb.drop_blocked_call failed")
-
-    async def end_call(self) -> None:
-        conn, self._listen_conn = self._listen_conn, None
-        if conn is not None:
-            try:
-                await conn.close()
-            except Exception:
-                pass
-        if not self._pool:
-            return
-        try:
-            if self.call_id is not None:
-                # 参加者と保留の印は通話中だけのもの。担い手 (handler) は最後の状態を記録として残す
-                await self._pool.execute(
-                    "UPDATE calls SET ended_at = now(), presence = '[]'::jsonb, hold_since = NULL"
-                    " WHERE id = $1",
-                    self.call_id,
-                )
-        except Exception:
-            logger.exception("CallDb.end_call failed")
-        finally:
-            pool, self._pool = self._pool, None  # 冪等化 (close経路とshutdown経路の二重呼び対策)
-            await pool.close()
-
-
 class PhoneAgent(Agent):
     """電話応答エージェント。過去通話の検索と切電のツールを持つ。"""
 
-    def __init__(self, db: CallDb, caller: str | None, job_ctx: JobContext):
-        super().__init__(instructions=build_instructions(caller))
+    def __init__(
+        self,
+        db: CallDb,
+        caller: str | None,
+        job_ctx,
+        *,
+        self_label: str = "",
+        staff: list[dict] | None = None,
+        prompt_overrides: dict[str, str] | None = None,
+        urgent_allowed_override: bool | None = None,
+    ):
+        super().__init__(
+            instructions=build_instructions(
+                caller,
+                self_label=self_label,
+                staff=staff,
+                prompt_overrides=prompt_overrides,
+            )
+        )
         self._db = db
         self._caller = caller
-
         self._job_ctx = job_ctx
+        self.self_label = self_label
+        self.staff = staff or []
+        self.prompt_overrides = prompt_overrides
+        self._urgent_allowed_override = urgent_allowed_override
 
-    @function_tool
     def _ai_in_charge(self) -> bool:
         """AI が今の担い手か (entrypoint の ctl。presence.py)。ctl が無い間 (通話の始まり) は AI"""
         ctl = getattr(self, "ctl", None)
         return ctl is None or ctl.get("handler") in (None, "ai")
 
+    @function_tool
     async def end_call(self, context: RunContext) -> None:
         """回線を切断する。別れの挨拶を言うときは必ずこれを呼ぶこと。
 
@@ -811,9 +338,7 @@ class PhoneAgent(Agent):
             await context.wait_for_playout()  # 別れの挨拶を言い終えるまで待つ
         except Exception:
             pass
-        await self._job_ctx.api.room.delete_room(
-            lk_api.DeleteRoomRequest(room=self._job_ctx.room.name)
-        )
+        await _safe_delete_room(self._job_ctx, self._db)
 
     @function_tool
     async def request_handoff(self, context: RunContext, reason: str) -> str:
@@ -843,7 +368,12 @@ class PhoneAgent(Agent):
         # ⚠**鳴らしてよい相手かはコードで決める。** プロンプトに条件を書いても確率的に破られる
         #   (LLMに任せるのは「用件が緊急か」まで)。許可は本人が管制室で与えたものだけを信用する —
         #   発信者番号は偽装され得るので、番号や名乗りからは推測しない (2026-08-01の調査)
-        if not _urgent_allowed(self._caller or ""):
+        allowed = (
+            self._urgent_allowed_override
+            if self._urgent_allowed_override is not None
+            else _urgent_allowed(self._caller or "")
+        )
+        if not allowed:
             logger.info("request_handoff: 未許可の相手なので鳴らさない (%s)", self._caller)
             return (
                 "この相手は呼び出しを許可されていません。"
@@ -914,279 +444,6 @@ class PhoneAgent(Agent):
     # 役立つ情報を agent_note (後方支援メモ) として自発的にプッシュしてくる (entrypoint参照)
 
 
-def _make_live_vad():
-    """live 構成の VAD。silero (既定) か webrtc (軽い、LIVE_VAD=webrtc)。
-    同じ 97 秒の通話音声で CPU は silero 10.1 秒 / webrtc 1.4 秒 (2026-10-02、手元の PC)"""
-    if os.environ.get("LIVE_VAD", "silero") == "webrtc":
-        from webrtc_vad import WebRTCVAD
-
-        return WebRTCVAD()
-    return silero.VAD.load()
-
-
-def _make_stt():
-    """STTは STT_PROVIDER 環境変数で切り替え (デフォルト: deepgram)。
-
-    - deepgram: nova-3。確定が速い (0.3〜0.4s) が、日本語の電話音声 (8kHz) で誤認識が目立つ
-                (2026-07-18実機:「この後どうすか」→「この後道どうすか。ばあたり。」)
-    - google:   Cloud Speech-to-Text v2 ストリーミング。認証はCloud TTSと同じSA鍵。
-                モデルは GOOGLE_STT_MODEL で切替 (latest_long / telephony / chirp_2 等。
-                chirp系はストリーミング対応リージョンが限られる → GOOGLE_STT_LOCATION)
-    """
-    if os.environ.get("STT_PROVIDER", "deepgram") == "google":
-        # ⚠既定は0 =「speech_end_timeout を指定しない」(Google任せ)。0以外で明示指定になる。
-        #
-        # ⚠**この値を入れると会話が1往復で死ぬ** (2026-07-31にA/Bで確定)。
-        #   0.8を指定すると相手の**1発話目しか認識されず**、以降は無言扱いになって
-        #   無言検知の切断まで進む。同じシナリオで実測: 0.8=7発話/81秒(1往復で死亡) /
-        #   未指定=15発話/123秒(正常)。Googleが無音検知でストリームを閉じ、
-        #   張り直されないためと見られる。
-        #
-        # ⚠そもそもこれを入れた動機 (「無音を挟んだ2発話が1つの17秒発話にまとめられる」) は、
-        #   **GCPファイアウォールのRTPポート不一致で相手の音声が虫食いで届いていた**のが原因
-        #   だった (許可 udp:10000-10500 に対し Asterisk の実使用は 20000-20500)。
-        #   音が飛び飛びなら発話の切れ目が見つからないのは当然で、STTの設定は無実だった。
-        #   回線を直した後は未指定でも まとめ吐きは再現しない。**症状の原因を1つ下の層で
-        #   取り違えた例**として残す — 直す前に、その層まで音が届いているかを先に測ること。
-        end_timeout = float(os.environ.get("GOOGLE_STT_END_TIMEOUT") or "0")
-        extra = {"speech_end_timeout": end_timeout} if end_timeout > 0 else {}
-        return google.STT(
-            languages="ja-JP",
-            detect_language=False,
-            model=os.environ.get("GOOGLE_STT_MODEL", "latest_long"),
-            location=os.environ.get("GOOGLE_STT_LOCATION", "global"),
-            **extra,
-            # speech_end_timeout は既定で渡さない (経緯は上の end_timeout の注記)
-            credentials_file=os.environ.get(
-                "GOOGLE_TTS_CREDENTIALS", "/secrets/callagent-tts.json"
-            ),
-        )
-    return deepgram.STT(model="nova-3", language="ja")
-
-
-def _make_one_tts(provider: str):
-    """プロバイダ名1つからTTSを作る (フォールバックの組み立ては _make_tts 側でやる)。"""
-    if provider == "aivis":
-        # Aivis Cloud API (声=コハク)。初回バイト0.08〜0.12秒の実測 → 詳細は aivis_tts.py
-        return AivisTTS(
-            api_key=os.environ.get("AIVIS_API_KEY", ""),
-            # ⚠get()の既定値ではなく or を使う。composeが `${VAR:-}` で**空文字**を
-            #   渡してくるため、キーは存在してしまい既定値が効かない (2026-07-30)
-            model_uuid=os.environ.get("AIVIS_MODEL_UUID") or AIVIS_DEFAULT_MODEL,
-            speaking_rate=float(os.environ.get("AIVIS_SPEAKING_RATE") or "1.2"),
-            # 既定2.0。1.0だと電話で「声が小さい」= Googleより8dB低かった (aivis_tts.py参照)
-            volume=float(os.environ.get("AIVIS_VOLUME") or "2.0"),
-        )
-    if provider == "google":
-        return _make_google_tts()
-    if provider == "elevenlabs":
-        # 日本語の漢字読み間違いが多く不採用 (2026-07-18)。コードは切替可能なまま残置
-        from livekit.plugins import elevenlabs
-
-        return elevenlabs.TTS(model="eleven_flash_v2_5", language="ja")
-    if provider == "voicevox":
-        return VoicevoxTTS(
-            base_url=os.environ.get("VOICEVOX_URL", "http://voicevox:50021"),
-            speaker=int(os.environ.get("VOICEVOX_SPEAKER", "2")),
-        )
-    # ⚠3.8 は livekit-plugins-google 1.8.3 以上が要る (1.8.2 だと instructions を読み上げる。
-    #   requirements.txt 参照)。GEMINI_TTS_MODEL で戻せる
-    return google.beta.GeminiTTS(
-        model=os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts"),
-        voice_name=os.environ.get("GEMINI_VOICE", "Leda"),
-        instructions="電話の受付担当として、丁寧で自然な日本語で話してください。",
-    )
-
-
-# 管制室の設定画面に出す選択肢。ここに無い値が来たら gemini 扱いになる
-TTS_CHOICES = ("aivis", "google", "gemini", "elevenlabs", "voicevox")
-
-
-def _make_tts(primary: str | None = None, fallback: str | None = None):
-    """メイン/サブの2段構えでTTSを作る。
-
-    引数は管制室の設定 (settingsテーブル) から渡される。None なら環境変数の既定を使う。
-    ⚠**サブを置く理由**: 外部APIに声を預けると、落ちたときに電話が無言になる。
-      通話で一番痛い障害がそれなので、合成が失敗したら FallbackAdapter が次に切り替える。
-      サブ無し (None/same) でも動くが、その場合は無言になるリスクを受け入れることになる。
-
-    - google:   Google Cloud TTS StreamingSynthesize (Chirp 3: HD)。真のストリーミングで
-                初動が速く、日本語の読み(漢字)もGoogle品質。認証はサービスアカウント鍵
-                (GOOGLE_TTS_CREDENTIALS、GOOGLE_API_KEYでは動かない)
-    - gemini:   Gemini TTS (gemini-3.8-flash-tts)。既存のGOOGLE_API_KEYで動く。
-                声は GEMINI_TTS_VOICE (Live APIと同じ30声: Leda/Kore/Aoede/Zephyr等)。
-                非ストリーミングで初動1〜2秒
-    - voicevox: ローカルのVOICEVOX ENGINE (compose --profile voicevox で起動)。
-                無料だがCPU合成が重い — このPC(省電力CPU+WSL2)では1文約6秒で電話には不適
-                (2026-07-16実測)。強いマシンに載せ替えたら再検討
-    """
-    main = primary or os.environ.get("TTS_PROVIDER", "gemini")
-    sub = fallback if fallback is not None else os.environ.get("TTS_FALLBACK", "google")
-    voice = _make_one_tts(main)
-    if not sub or sub == main or sub == "none":
-        logger.info("TTS: %s (サブなし)", main)
-        return voice
-    try:
-        backup = _make_one_tts(sub)
-    except Exception:
-        # サブの構成に失敗しても通話は止めない (メインが生きているなら喋れる)
-        logger.exception("TTSのサブ(%s)を構成できなかった — メイン単体で続行", sub)
-        return voice
-    logger.info("TTS: %s (サブ: %s)", main, sub)
-    return tts_mod.FallbackAdapter([voice, backup])
-
-
-def _make_google_tts():
-    """Google Cloud TTS (Chirp3-HD)。aivis のフォールバック先としても使う。"""
-    # ストリーミング合成は初動0.11sと速いが、テキスト断片ごとの逐次合成で
-    # 韻律が乱れる (2026-07-18実機)。文単位の一括合成 (初動0.3s) は品質が安定 —
-    # 文分割・並列合成はフレームワークのStreamAdapterがやってくれる
-    streaming = os.environ.get("GOOGLE_TTS_STREAMING", "0") == "1"
-    kwargs = {}
-    if not streaming:
-        # ⚠一括合成APIはPCM(デフォルト)非対応 — LINEAR16必須
-        # (PCMのままだと全合成が400エラーで無音になる。2026-07-18実機で被弾)
-        kwargs["audio_encoding"] = gcloud_texttospeech.AudioEncoding.LINEAR16
-    return google.TTS(
-        language="ja-JP",
-        voice_name=os.environ.get("GOOGLE_TTS_VOICE", "ja-JP-Chirp3-HD-Leda"),
-        use_streaming=streaming,
-        credentials_file=os.environ.get("GOOGLE_TTS_CREDENTIALS", "/secrets/callagent-tts.json"),
-        **kwargs,
-    )
-
-
-def _make_session(tts_primary: str | None = None, tts_fallback: str | None = None) -> AgentSession:
-    """AIコアは AI_CORE 環境変数で切替 (デフォルト: live)。
-
-    - live:    Gemini Live API。音声→音声で速い・自然。声は GEMINI_VOICE
-    - cascade: Deepgram STT → Gemini 3.5 Flash (thinking無効) → _make_tts()。
-               賢さ優先だがターン遅延が大きい (2026-07-16実測で体感NG)
-    """
-    # ⚠割り込みの閾値を上げる (2026-07-30の実機テストで判明)。
-    # 既定 (0.5秒・語数制限なし) だと、相手が電話に向けてではなく横で言った独り言
-    # (「お礼言われた」) でAIが文の途中で黙り、相手からは「え、消えた」と見える。
-    # 実際にそう言われた。相槌 (「うん」「はい」「ええ」) で止まるのも同じ理屈。
-    # 0.8秒 + 2語以上を要求すると、相槌では止まらず、本当の割り込みには従う。
-    # ⚠上げすぎると「もういいです」で切りたい相手を黙らせる無礼な機械になるので、
-    #   自動テスト (相手役AIのシナリオ) で両方向を確認してから動かすこと
-    interrupt_sec = float(os.environ.get("MIN_INTERRUPTION_SEC", "0.8"))
-    interrupt_words = int(os.environ.get("MIN_INTERRUPTION_WORDS", "2"))
-    if os.environ.get("AI_CORE", "live") == "cascade":
-        return AgentSession(
-            user_away_timeout=SILENCE_SEC,
-            vad=silero.VAD.load(),
-            stt=_make_stt(),
-            min_interruption_duration=interrupt_sec,
-            # 語数判定はSTTの結果を使うのでcascadeでのみ有効
-            min_interruption_words=interrupt_words,
-            # STT暫定結果でLLM+TTSを見切り発車し、確定と一致すればそのまま採用
-            # (Google STTの確定待ち約1.2sを隠蔽。音質・応答内容への影響なし)
-            preemptive_generation=True,
-            # thinkingは遅延の主因なので最小化する。⚠Gemini 3系は thinking_budget=0 が
-            # 「無視される」(警告ログのみ、こっそりthinkingが動く) — thinking_level が正
-            # (2026-07-18 実機ログの警告で判明。LLM初トークン0.8〜1.2sの一因だった)
-            # 🚨**3.6には戻さない** (2026-08-01夜に切り戻し)。同日昼に3.6へ上げたが、
-            # **ツール宣言があるとき、関数呼び出しが本文に溢れる**のを実測した:
-            #   「…失礼します。幕頭[call:default_api:end_call{}]」「…失礼します。 चिरend_call{}」
-            #   「…失礼します。#CALL:default_api:end_call{}」「…失礼します。大吉」
-            # ⚠**しかもその回はツールが呼ばれていない** = 切るつもりで切れていない。
-            #   「end_call が実測4/5」と記録してきた現象の正体はこれの可能性が高い。
-            # ⚠この文字列は**TTSに渡るので相手に聞こえている**。記録の汚れでは済まない。
-            # 切り分け (infra/scripts/probe_stray_tokens.py、各15サンプル×3回):
-            #   本番構成(3.6+ツール+本番プロンプト) 13/45 異常 / 3.5へ戻す **0/45** /
-            #   ツール宣言を外す **0/45** / プロンプトを最小化 1/45 / 温度は無関係(0.2でも同率)
-            #   → 3.6 × ツール宣言 の組み合わせが原因。プロンプトの長さは発生率を上げるだけ
-            # 再挑戦するなら、上のスクリプトを回して 0/45 になってからにすること
-            # ⚠テキストモデルも環境変数で差し替えられるようにした (2026-09-18)。
-            #   API の models 一覧には 3.6 / 3.7 / 3.8-flash があるが、**既定は 3.5 のまま**。
-            #   8/1 に 3.6 へ上げたとき、ツール宣言があると関数呼び出しが本文に溢れて
-            #   相手に聞こえた (13/45)。上げるなら run_scenarios の no_tool_leak で測ってから。
-            llm=google.LLM(
-                model=os.environ.get("GEMINI_TEXT_MODEL", "gemini-3.5-flash"),
-                temperature=0.7,
-                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
-            ),
-            tts=_make_tts(tts_primary, tts_fallback),
-        )
-    return AgentSession(
-        user_away_timeout=SILENCE_SEC,
-        # ⚠**live でも手元の VAD が要る** (2026-09-18、ユーザーが実機で「自分で話していても
-        #   『もしもし？』になる」と指摘して判明)。Gemini のプラグインは相手の発話開始を
-        #   **割り込まれたときしか**フレームワークに伝えない (realtime_api.py の
-        #   _handle_input_speech_started は interrupted と自発 generate の直前だけ)。
-        #   だから user_state は一度も speaking にならず、AI が黙った SILENCE_SEC 秒後に
-        #   相手が喋っていようが away → 「もしもし？聞こえていますか？」が必ず出ていた。
-        #   turn ログ (06:24 の aizuchi) に user listening→speaking が 1 件も無いのが証拠。
-        #   ターン検出そのものは引き続きサーバー側 (Gemini)。
-        # ⚠VAD が効くのは user_state (無言判定・「相手が話している最中か」) だけ (2026-10-02 に確認)。
-        #   ターン検出が realtime_llm のとき、フレームワークは VAD による割り込みを飛ばす
-        #   (agent_activity.on_vad_inference_done の冒頭)。下の min_interruption_duration も live では効かない。
-        # LIVE_VAD=webrtc で軽い VAD に替えられる (webrtc_vad.py。試験中、既定は silero)
-        vad=_make_live_vad(),
-        # s2sは語数判定に使えるSTT結果を持たないので秒数だけで抑える
-        min_interruption_duration=interrupt_sec,
-        # ⚠既定を **gemini-3.8-live** にした (2026-09-18)。7/30に「再検討する」と置いた
-        #   2条件のうち②が解けたため。実測した capabilities:
-        #     3.1-flash-live : mutable_instructions=False / mutable_chat_context=False
-        #     3.8-live       : mutable_instructions=True  / mutable_chat_context=True
-        #   ⚠**3.1では chat_ctx も更新できなかった**= inject_chat_text で届けている
-        #     **耳打ちも後方支援メモも live 構成では一切届いていなかった**。
-        #     (案件mdは「指示更新ができない」としか書いておらず、被害範囲を過小に記録していた)
-        #   プラグイン自身も3.1に対して「will not be applied until the next session」と警告する。
-        # ⚠モデルIDは実在を API の models 一覧で確認したもの。もう1つ
-        #   `gemini-3.8-live-extended-thinking` があり capabilities は同じ。
-        #   思考を入れると遅延が増えるはずなので、電話では既定にしない。
-        llm=google.beta.realtime.RealtimeModel(
-            model=os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.8-live"),
-            # 請求先 (2026-10-08、vertex.py)。VERTEX_PROJECT があれば Vertex AI (VM のサービスアカウントで認証)、
-            # 無ければ GOOGLE_API_KEY。⚠Live は us-central1 にしか無い
-            **(
-                {"vertexai": True, "project": vertex.project(), "location": vertex.live_location()}
-                if vertex.project()
-                else {}
-            ),
-            voice=os.environ.get("GEMINI_VOICE", "Leda"),
-            language="ja-JP",
-            # ⚠相手の声の文字起こしも日本語に固定する (2026-09-29)。既定は言語の自動判定で、
-            #   関西弁の年配の相手 (ユーザーの父) の声がスペイン語・ベンガル語・中国語として
-            #   記録され、AI もスペイン語で返した。language= は AI の声の言語で、こちらには効かない
-            input_audio_transcription=genai_types.AudioTranscriptionConfig(language_codes=["ja-JP"]),
-            # ⚠長電話の費用に上限を付ける (2026-10-02)。Live API は**毎ターン、それまでの文脈を全部
-            #   入力として数え直して課金する**ので、費用は通話の長さの 2 乗で増える (2分の試験通話で
-            #   音声入力 398→938→1,678 と累積)。文脈が LIVE_CONTEXT_TRIGGER (既定 64,000 ≒ 会話20分)
-            #   を超えたら古いやり取りから詰める。普通の通話 (数分) はここに届かないので何も変わらない
-            context_window_compression=genai_types.ContextWindowCompressionConfig(
-                trigger_tokens=int(os.environ.get("LIVE_CONTEXT_TRIGGER") or "64000"),
-                sliding_window=genai_types.SlidingWindow(
-                    target_tokens=int(os.environ.get("LIVE_CONTEXT_TARGET") or "32000")
-                ),
-            ),
-            temperature=0.8,
-            # ⚠相手の「間」への食い付きを鈍らせる (2026-09-18)。
-            #   3.8 は既定だと相手が「佐藤」で一拍置いた瞬間に返事を始め、相手の続きが
-            #   拾われないまま無言扱いになった (実測 05:50:41、aizuchi の no_truncated_ai も同型)。
-            #   電話は相槌と言い淀みが多いので、発話終了の判定を鈍く・沈黙の要求時間を長めにする。
-            #   ⚠上げすぎると返事が遅れる (7/16「電話は遅延が先に体験を壊す」)。
-            #     LIVE_END_SILENCE_MS で調整し、run_scenarios の aizuchi と ttft で両側を見る
-            realtime_input_config=genai_types.RealtimeInputConfig(
-                automatic_activity_detection=genai_types.AutomaticActivityDetection(
-                    end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_LOW,
-                    silence_duration_ms=int(os.environ.get("LIVE_END_SILENCE_MS", "800")),
-                )
-            ),
-        ),
-        # say() 用のTTS (Live APIと同系のLedaの声)。⚠**3.8でも supports_say=False のまま**なので、
-        # 固定挨拶は引き続き say() で確定再生する (2026-07-17実機エラーで判明・2026-09-18に再確認)
-        # ⚠管制室の声の設定 (tts_primary / tts_fallback) は **live では見ない** (2026-09-19)。
-        #   ここで作る TTS は挨拶・無言時の促し・切る前の一言の 3 つにしか使われず、会話本体は
-        #   Gemini の GEMINI_VOICE で喋る。設定で Aivis 等を選ぶと定型文だけ別人の声になるので、
-        #   Live API と同系の Google Cloud TTS (GOOGLE_TTS_VOICE = Chirp3-HD の同名の声) に固定する。
-        #   管制室の設定ページも live のときは声の選択を出さない (settings/page.tsx)
-        tts=_make_tts("google", "gemini"),
-    )
-
-
 def _caller_number(ctx: JobContext) -> str | None:
     """SIP参加者の属性から発信者番号を拾う (Asterisk→LiveKit SIP経由)。
     テスト通話 (caller-sim) は属性が無いため、ルーム名 call_<番号>_xxx から拾う。"""
@@ -1194,8 +451,9 @@ def _caller_number(ctx: JobContext) -> str | None:
         number = p.attributes.get("sip.phoneNumber")
         if number:
             return number
-    # 頭はテナントの room_prefix (call / kumiai …、2026-10-04)
-    m = re.match(r"[a-z0-9]+_(\+?\d+)_", ctx.room.name)
+    # ルーム名 call_<番号>_xxx から拾う
+    rname = getattr(ctx, "room_name", None) or ctx.room.name
+    m = re.match(r"[a-z0-9]+_(\+?\d+)_", rname)
     return m.group(1) if m else None
 
 
@@ -1243,33 +501,33 @@ async def _answer_mode() -> str | None:
         return None
 
 
-def _apply_tenant(room: str) -> str:
-    """部屋名からテナント (管制室) を決め、その DB・作業フォルダ・hookd・名乗りに切り替える (2026-10-04)。
-    ⚠通話 1 本ごとに別プロセスなので、ここで環境とモジュールの値を書き換えてよい
-    (プロセスは使い回されない。待機プロセスはテナント共通で、着信の時点で決まる)"""
-    global DATABASE_URL, OWNER_NAME, TRANSCRIPT_DIR
-    t = tenant_registry.for_room(room)
-    if not t:
-        return tenant_registry.DEFAULT_ID
-    os.environ.update(tenant_registry.env_for(t))
-    DATABASE_URL = os.environ.get("DATABASE_URL", "")
-    OWNER_NAME = os.environ.get("OWNER_NAME", "").strip()
-    if t["id"] != tenant_registry.DEFAULT_ID:
-        # 生の文字起こし (jsonl) もテナントごとに分ける
-        TRANSCRIPT_DIR = TRANSCRIPT_DIR / "tenants" / t["id"]
-    return t["id"]
+async def entrypoint(ctx):
+    # LiveKit 接続前に DB リースを確認・心拍を開始する (2026-11-07):
+    # コールドスタート遅延で後から起動した古いリクエストが LiveKit に接続して現役インスタンスを
+    # DUPLICATE_IDENTITY で追い出すのを防ぎ、かつ起動直後から heartbeat を打つため。
+    room_name = getattr(ctx, "room_name", None) or ctx.room.name
+    caller = getattr(ctx, "caller_override", None) or _caller_number(ctx)
+    db = CallDb(lease_token=getattr(ctx, "lease_token", None))
+    has_prior_segments = await db.start_call(room_name, caller)
+    ctx.add_shutdown_callback(db.end_call)
+    if db.lease_lost:
+        logger.warning("aborting entrypoint before connect: lease already superseded (%s)", room_name)
+        return
+    if hasattr(ctx, "attach_db"):
+        ctx.attach_db(db)
+    # 実際に過去の会話セグメントが存在する場合のみ「再入室の詫び」にする (挨拶前のリトライでは通常挨拶)
+    is_reentry = bool(has_prior_segments)
 
-
-async def entrypoint(ctx: JobContext):
-    tenant = _apply_tenant(ctx.room.name)
+    t_join_start = asyncio.get_running_loop().time()
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-    logger.info("joined room %s (tenant %s)", ctx.room.name, tenant)
-
-    # 通話行は入室した瞬間に作る (番号はルーム名 call_<番号>_xxx から即時取得)。
-    # 管制室が発信者の参加より先に接続を始められる = 挨拶の頭切れ・画面表示の遅さ対策 (2026-07-18)
-    caller = _caller_number(ctx)
-    db = CallDb()
-    await db.start_call(ctx.room.name, caller)
+    logger.info(
+        "BENCH T3_joined room=%s connect_ms=%.1f",
+        ctx.room.name,
+        (asyncio.get_running_loop().time() - t_join_start) * 1000,
+    )
+    if db.lease_lost or not await db.check_lease():
+        logger.warning("aborting entrypoint after connect: lease superseded (%s)", ctx.room.name)
+        return
 
     # 発信者 (SIP参加者) のjoinを待ってから応対を始める。電話は掛けられた側が先に名乗るのが
     # 自然だが、joinを待たずに挨拶を生成すると相手の音声経路確立前に握りつぶされて
@@ -1305,13 +563,11 @@ async def entrypoint(ctx: JobContext):
             )
             await db.drop_blocked_call()
             await db.end_call()
-            try:
-                await ctx.api.room.delete_room(lk_api.DeleteRoomRequest(room=ctx.room.name))
-            except Exception:
-                logger.exception("ブロックした呼のルーム削除に失敗")
+            await _safe_delete_room(ctx, db)
             return
 
     writer = TranscriptWriter(ctx.room.name, caller)
+    ctx.add_shutdown_callback(writer.close)
 
     if outbound:
         await db.mark_outbound(caller)
@@ -1339,18 +595,21 @@ async def entrypoint(ctx: JobContext):
 
     # 声のメイン/サブは管制室の設定から (未設定なら環境変数)。通話ごとに読むので次の通話から効く
     session = _make_session(*await db.tts_providers())
-    global SELF_LABEL, STAFF
-    SELF_LABEL = await db.setting("self_label")
+    ctx.add_shutdown_callback(session.aclose)
+    call_self_label = await db.setting("self_label")
     try:
-        STAFF = [
+        call_staff = [
             s for s in json.loads(await db.setting("staff") or "[]")
             if isinstance(s, dict) and s.get("surname")
         ]
     except (json.JSONDecodeError, TypeError):
-        STAFF = []
+        call_staff = []
+    prompt_overrides = getattr(ctx, "prompt_overrides", None)
+    urgent_allowed_override = getattr(ctx, "urgent_allowed_override", None)
 
     # 締めの挨拶を言った回数 (相手が用件の続きを言ったら 0 に戻る)。_hangup_after_goodbye
     closing = {"said": 0}
+    stt_tracker = CallSttTracker(ctx.room, db, writer)
 
     @session.on("conversation_item_added")
     def on_item(ev: ConversationItemAddedEvent):
@@ -1361,7 +620,8 @@ async def entrypoint(ctx: JobContext):
             if speaker == "ai" and ctl["handler"] != "ai":
                 return
             interrupted = bool(getattr(ev.item, "interrupted", False))
-            if speaker == "ai" and TOOL_LEAK.search(ev.item.text_content):
+            raw_text = ev.item.text_content
+            if speaker == "ai" and TOOL_LEAK.search(raw_text):
                 # ⚠**消さずに残して、目立つように鳴らす** (2026-08-01)。
                 #   関数呼び出しが本文に溢れる = その回はツールが呼ばれていない可能性が高い
                 #   (切るつもりで切れていない)。文字列を消すと**実害の証拠だけが消えて
@@ -1369,16 +629,15 @@ async def entrypoint(ctx: JobContext):
                 #   詳しくは _make_session の llm= のコメント (3.6で実測した件)
                 logger.error(
                     "🚨ツール呼び出しが本文に漏れた — モデルを疑うこと: %r",
-                    ev.item.text_content[-60:],
+                    raw_text[-60:],
                 )
-            writer.add_segment(speaker, ev.item.text_content, interrupted)
-            asyncio.create_task(db.add_segment(speaker, ev.item.text_content, interrupted))
-            if speaker == "ai" and not interrupted and GOODBYE.search(ev.item.text_content):
+            stt_tracker.record_conversation_item(speaker, raw_text, interrupted)
+            if speaker == "ai" and not interrupted and GOODBYE.search(raw_text):
                 closing["said"] += 1
                 asyncio.create_task(_hangup_after_goodbye(closing["said"]))
-            elif speaker == "caller" and closing["said"] and not _is_farewell(ev.item.text_content):
+            elif speaker == "caller" and closing["said"] and not _is_farewell(raw_text):
                 # 締めた後に相手が用件の続きを言った → 締めは無かったことにして会話へ戻る
-                logger.info("締めの後に相手が続けた — 切らない: %r", ev.item.text_content[:40])
+                logger.info("締めの後に相手が続けた — 切らない: %r", raw_text[:40])
                 closing["said"] = 0
 
     async def _wait_ai_quiet(max_sec: float = 30.0) -> None:
@@ -1408,10 +667,7 @@ async def entrypoint(ctx: JobContext):
         if closing["said"] != n or ctl["handler"] != "ai":
             return  # 相手が続けた (said=0) か、次の挨拶のタスクに任せる
         logger.info("締めの挨拶 (%d 回目) のあと end_call が無かったので切る", n)
-        try:
-            await ctx.api.room.delete_room(lk_api.DeleteRoomRequest(room=ctx.room.name))
-        except Exception:
-            pass  # end_call が先に切っていた
+        await _safe_delete_room(ctx, db)
 
     # 応答遅延の内訳計測 (cascadeの「一瞬の間」の犯人捜し用)。
     # metrics_collected はコンポーネントごとに飛んでくるので speech_id で束ねて、
@@ -1442,12 +698,6 @@ async def entrypoint(ctx: JobContext):
             )
             turn_lat.pop(sid, None)
 
-    async def on_shutdown():
-        writer.close()
-        await db.end_call()
-
-    ctx.add_shutdown_callback(on_shutdown)
-
     # セッションが (エラーで) 閉じたらルームごと畳む — 相手を無音のまま待たせない・
     # 参加者退出→ジョブ終了→end_call の正規経路が確実に走る。プロセス即死の場合のみ
     # hookd の reaper が拾う (多層防御。2026-07-18: 孤児通話の根本対策)
@@ -1458,10 +708,7 @@ async def entrypoint(ctx: JobContext):
             logger.error("session closed with error: %s — ルームを畳んで通話を終了する", err)
 
         async def _teardown():
-            try:
-                await ctx.api.room.delete_room(lk_api.DeleteRoomRequest(room=ctx.room.name))
-            except Exception:
-                pass  # 既にルームが無い正常終了時はここに来る
+            await _safe_delete_room(ctx, db)
 
         asyncio.create_task(_teardown())
 
@@ -1500,81 +747,36 @@ async def entrypoint(ctx: JobContext):
 
     @ctx.room.on("participant_connected")
     def on_participant_connected(p: rtc.RemoteParticipant):
-        _kick(f"join {p.identity}")
+        if p.identity.startswith(("operator-", "watch-", "dashboard-")):
+            _kick(f"join {p.identity}")
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(p: rtc.RemoteParticipant):
-        _kick(f"leave {p.identity}", LEAVE_SETTLE_SEC if p.identity.startswith("operator-") else 0.0)
-
-    # 本人 (operator) の声は AgentSession の入力対象外 (sessionは発信者の音声だけを聴く) —
-    # 専用のSTTストリームで文字起こしして speaker='user' として記録する (2026-07-18)。
-    # これで交代後・書記モードの本人発話も画面/DB/吹き出し支援(watcher)に届く
-    def _transcribe_operator(track: rtc.RemoteTrack, identity: str):
-        async def run():
-            # AudioStreamは通話中1本だけ持ち、STTストリームは落ちても張り直す。
-            # マイク音声をpumpが「今のSTTストリーム」に流し込む (差し替え可能な参照経由)
-            audio = rtc.AudioStream(track, sample_rate=16000, num_channels=1)
-            current: dict = {"stream": None}
-            stopped = asyncio.Event()
-
-            async def pump():
-                n = 0
-                try:
-                    async for ev in audio:
-                        n += 1
-                        if n == 1 or n % 500 == 0:
-                            logger.info("operator音声 frame#%d (%s)", n, identity)
-                        s = current["stream"]
-                        if s is not None:
-                            try:
-                                s.push_frame(ev.frame)
-                            except Exception:
-                                pass  # 差し替えの隙間はフレームを捨てるだけ
-                finally:
-                    logger.info("operator音声 pump終了 (frames=%d, %s)", n, identity)
-                    stopped.set()  # トラック終了 (operator退室/通話終了) = 本人発話の終わり
-
-            pump_task = asyncio.create_task(pump())
-            # STT張り直しループ: 本人が沈黙する時間帯があると Google Cloud STT が
-            # Audio Timeout で確定クラッシュする (2026-07-19実機。「拾われてない」の真因は
-            # 精度ではなく、一度落ちたSTTストリームが二度と復活しなかったこと)。
-            # プロバイダは _make_stt() のまま (STT_PROVIDER設定を発信者用と共通で使う) —
-            # 効くのは「落ちても即座に新しいストリームを張り直す」ことで、これはどの
-            # プロバイダでも要る保険
-            while not stopped.is_set():
-                stream = _make_stt().stream()
-                current["stream"] = stream
-                try:
-                    async for ev in stream:
-                        if ev.type == lk_stt.SpeechEventType.FINAL_TRANSCRIPT and ev.alternatives:
-                            text = ev.alternatives[0].text.strip()
-                            if text:
-                                writer.add_segment("user", text, False)
-                                await db.add_segment("user", text, False)
-                except Exception as e:
-                    logger.info("operator STT張り直し (%s): %s", identity, type(e).__name__)
-                finally:
-                    current["stream"] = None
-                    try:
-                        await stream.aclose()
-                    except Exception:
-                        pass
-                if not stopped.is_set():
-                    await asyncio.sleep(0.3)  # 軽いバックオフ (張り直しの暴走防止)
-            pump_task.cancel()
-            logger.info("operator文字起こし終了 (%s)", identity)
-
-        asyncio.create_task(run())
+        if p.identity.startswith("operator-"):
+            # ⚠書記モードや本人応対中 (ai_on=False) にスマホ側の WebRTC ICE 瞬断で再接続する場合、
+            #   1.2秒だと再接続完了前に「保留」へ落ちてしまうため 6.0秒待つ。「AIに任せる」(ai_on=True) は 1.2秒
+            delay = LEAVE_SETTLE_SEC if ctl["ai_on"] else 6.0
+            _kick(f"leave {p.identity}", delay)
+        elif p.identity.startswith(("watch-", "dashboard-")):
+            _kick(f"leave {p.identity}", 0.0)
 
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(
         track: rtc.RemoteTrack, pub: rtc.RemoteTrackPublication, p: rtc.RemoteParticipant
     ):
-        if p.identity.startswith("operator-") and track.kind == rtc.TrackKind.KIND_AUDIO:
-            logger.info("operator音声を購読 — 本人の文字起こし開始 (%s)", p.identity)
-            _transcribe_operator(track, p.identity)
+        stt_tracker.handle_track_subscribed(track, p, participant.identity)
 
-    agent = PhoneAgent(db=db, caller=caller, job_ctx=ctx)
+    stt_tracker.sync_tracks(participant.identity)
+
+    agent = PhoneAgent(
+        db=db,
+        caller=caller,
+        job_ctx=ctx,
+        self_label=call_self_label,
+        staff=call_staff,
+        prompt_overrides=prompt_overrides,
+        urgent_allowed_override=urgent_allowed_override,
+    )
     # 入力音声のリンク先を発信者に明示する。participant_kinds も明示しないと
     # AGENT種別 (テスト用caller-sim) の音声が既定フィルタで弾かれる (2026-07-18実測)
     await session.start(
@@ -1614,6 +816,7 @@ async def entrypoint(ctx: JobContext):
         #   「促した → 相手が話し始めた → まだ文字が来ない → 10秒経過 → 切る」が起こりうる
         #   (ユーザーの指摘「無言判定が STT で文字が出るまでの時間になっている」がこれ)
         if getattr(ev, "new_state", "") == "speaking":
+            stt_tracker.on_caller_speaking()
             silence_state["prompted"] = False
             silence_state["gen"] += 1
             return
@@ -1702,10 +905,7 @@ async def entrypoint(ctx: JobContext):
         except Exception:
             logger.exception("別れの挨拶の再生待ちに失敗 (そのまま切る)")
         await db.end_call()
-        try:
-            await ctx.api.room.delete_room(lk_api.DeleteRoomRequest(room=ctx.room.name))
-        except Exception:
-            logger.exception("無言による切断でroom削除に失敗 (通話は既に終わっている可能性)")
+        await _safe_delete_room(ctx, db)
 
     session.on("user_state_changed", _on_user_state)
 
@@ -1725,11 +925,15 @@ async def entrypoint(ctx: JobContext):
     # 相手が一度でも喋ったら猶予をリセットする (会話が始まった後の沈黙は別物)
     @session.on("user_input_transcribed")
     def _on_user_spoke(ev) -> None:
+        is_fin = bool(getattr(ev, "is_final", False))
+        t_str = (getattr(ev, "transcript", "") or "").strip()
         logger.info(
             "turn: transcribed final=%s %r",
-            getattr(ev, "is_final", None), (getattr(ev, "transcript", "") or "")[:40],
+            is_fin, t_str[:40],
         )
-        if getattr(ev, "is_final", False):
+        if not is_fin:
+            stt_tracker.on_caller_interim_transcribed(t_str)
+        if is_fin:
             silence_state["prompted"] = False
             silence_state["gen"] += 1  # 眠っている古い _handle_silence を無効化する
 
@@ -1739,7 +943,12 @@ async def entrypoint(ctx: JobContext):
     extra = {"context": None}
 
     async def refresh_instructions():
-        text = build_instructions(caller)
+        text = build_instructions(
+            caller,
+            self_label=call_self_label,
+            staff=call_staff,
+            prompt_overrides=prompt_overrides,
+        )
         if extra["context"]:
             text += f"\n# 相手についての事前情報 (着信時の自動下調べ)\n{extra['context']}\n"
         await agent.update_instructions(text)
@@ -1861,8 +1070,15 @@ async def entrypoint(ctx: JobContext):
                 logger.info("AI 応答 → %s (端末から)", "オン" if ai_on else "オフ")
                 _kick("ai_on")
 
-    asyncio.create_task(inject_caller_context())
-    asyncio.create_task(watch_agent_notes())
+    t_ctx_inject = asyncio.create_task(inject_caller_context())
+    t_notes_watch = asyncio.create_task(watch_agent_notes())
+
+    def _cancel_bg_tasks():
+        t_ctx_inject.cancel()
+        t_notes_watch.cancel()
+        stt_tracker.stop_all()
+
+    ctx.add_shutdown_callback(_cancel_bg_tasks)
 
     def _talkers() -> list[rtc.RemoteParticipant]:
         return [p for p in ctx.room.remote_participants.values() if p.identity.startswith("operator-")]
@@ -1910,7 +1126,11 @@ async def entrypoint(ctx: JobContext):
     async def _hold_timeout() -> None:
         await asyncio.sleep(HOLD_TIMEOUT_SEC)
         ctl["hold_timer"] = None  # ⚠_apply が自分を cancel しないように先に外す
-        if ctl["handler"] != "hold":
+        if (
+            ctl["handler"] != "hold"
+            or ctl["apply"] is None
+            or ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED
+        ):
             return
         # ⚠「自分で出る」の間は AI が引き取らない (2026-10-08 ユーザー)。保留のまま見張り直し、
         #   モードが変わっていたら次の区切りで引き取る。「AIに任せる」を押したときは従来どおり AI が出る
@@ -1925,7 +1145,20 @@ async def entrypoint(ctx: JobContext):
         await _apply("hold_timeout")
 
     async def _apply(reason: str) -> None:
+        if (
+            ctl["apply"] is None
+            or (getattr(ctx, "_closed", None) is not None and ctx._closed.is_set())
+            or ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED
+        ):
+            return
         async with ctl_lock:
+            if (
+                ctl["apply"] is None
+                or (getattr(ctx, "_closed", None) is not None and ctx._closed.is_set())
+                or ctx.room.connection_state != rtc.ConnectionState.CONN_CONNECTED
+            ):
+                return
+            stt_tracker.sync_tracks(participant.identity)
             new = _decide()
             old = ctl["handler"]
             await db.set_handler(new, _presence())
@@ -1994,15 +1227,18 @@ async def entrypoint(ctx: JobContext):
     async def _stop_player():
         # ⚠保留中に通話が終わったとき、タイマーと保留音を先に止める。止めずに aclose を待つと
         #   ジョブの終了が 10 秒の期限に間に合わず強制終了になった (2026-09-26 実測)
+        ctl["apply"] = None
         if ctl["hold_timer"] is not None:
             ctl["hold_timer"].cancel()
             ctl["hold_timer"] = None
         if ctl["music"] is not None:
             ctl["music"].stop()
             ctl["music"] = None
-        if ctl["player"] is not None:
+        player = ctl["player"]
+        ctl["player"] = None
+        if player is not None:
             try:
-                await asyncio.wait_for(ctl["player"].aclose(), 3)
+                await asyncio.wait_for(player.aclose(), 3)
             except Exception:
                 logger.info("保留音の片付けが間に合わなかった (そのまま終える)")
 
@@ -2014,6 +1250,24 @@ async def entrypoint(ctx: JobContext):
 
     if scribe_mode:
         return  # 挨拶もしない (本人が話す)
+    if is_reentry:
+        # 再入室モード (calld 再起動や瞬断からの自動復旧): 挨拶は繰り返さず、DB の会話記録を注入して詫びる
+        history = await db.fetch_transcript_history()
+        if history:
+            lines = [
+                f"{'相手' if h['speaker'] == 'caller' else 'AI/本人'}: {h['text']}"
+                for h in history
+            ]
+            await inject_chat_text(
+                "再入室時の会話履歴復元 (相手には聞こえていない。ここまでの流れを踏まえて続きを聞くこと)",
+                "\n".join(lines),
+            )
+        logger.info("BENCH T4_greeting room=%s reentry=True", ctx.room.name)
+        await speak_fixed(
+            "失礼いたしました、お電話が少々遠くなっておりました。続きをお伺いいたします。",
+            allow_interruptions=False,
+        )
+        return
     # 受話直後に一拍おく (人間らしい間 + 管制室モニタの接続が挨拶の頭に間に合いやすくなる)
     await asyncio.sleep(0.5)
     # 固定挨拶は say() で確定再生。generate_reply は gemini-3.1-flash-live-preview 非対応で
@@ -2024,17 +1278,34 @@ async def entrypoint(ctx: JobContext):
     # 実際に「AIが一言も発せないまま通話終了」が起きた。ここだけは相手より優先させる —
     # 名乗りと録音告知は「言えなかった」で済ませられない性質のものなので。
     # 代わりに GREETING を約3秒に詰めてある (長い文を割り込み無効で流すと無礼になる)
-    await speak_fixed(greeting(), allow_interruptions=False)
+    logger.info("BENCH T4_greeting room=%s reentry=False", ctx.room.name)
+    await speak_fixed(greeting(call_self_label), allow_interruptions=False)
 
 
 if __name__ == "__main__":
-    # job_memory_warn_mb=0: 通話プロセスのメモリ監視を止める (2026-10-02)。警告ログを出すだけの機能で、
-    #   5 秒ごとに全プロセスの smaps を読む。VM の py-spy で通話中 CPU の約 4% がこれだった
-    #   (上限 job_memory_limit_mb は元々 0 = なし)
-    # NUM_IDLE_PROCESSES: 着信に備えて先に立ち上げておく通話プロセスの数 (2026-10-02)。
-    #   既定はライブラリの既定 (本番は CPU 数 = e2-medium で 2)。1 つ約 380MB なので、
-    #   VM を 2GB に下げるなら 1 にする。2 本目の同時着信はプロセスの立ち上げを待つ
-    opts: dict = {"entrypoint_fnc": entrypoint, "job_memory_warn_mb": 0}
-    if os.environ.get("NUM_IDLE_PROCESSES"):
-        opts["num_idle_processes"] = int(os.environ["NUM_IDLE_PROCESSES"])
-    cli.run_app(WorkerOptions(**opts))
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    if os.environ.get("AGENT_MODE") == "http" or (len(sys.argv) > 1 and sys.argv[1] == "http"):
+        run_http_server(entrypoint)
+    elif os.environ.get("CLOUD_AGENT_URL", "").strip():
+        logger.error(
+            "CLOUD_AGENT_URL is set (%s) while AGENT_MODE=worker — "
+            "refusing to start local LiveKit worker to prevent duplicate room entry.",
+            os.environ.get("CLOUD_AGENT_URL"),
+        )
+        sys.exit(0)
+    else:
+        # job_memory_warn_mb=0: 通話プロセスのメモリ監視を止める (2026-10-02)。警告ログを出すだけの機能で、
+        #   5 秒ごとに全プロセスの smaps を読む。VM の py-spy で通話中 CPU の約 4% がこれだった
+        #   (上限 job_memory_limit_mb は元々 0 = なし)
+        # NUM_IDLE_PROCESSES: 着信に備えて先に立ち上げておく通話プロセスの数 (2026-10-02)。
+        #   既定はライブラリの既定 (本番は CPU 数 = e2-medium で 2)。1 つ約 380MB なので、
+        #   VM を 2GB に下げるなら 1 にする。2 本目の同時着信はプロセスの立ち上げを待つ
+        opts: dict = {"entrypoint_fnc": entrypoint, "job_memory_warn_mb": 0}
+        if os.environ.get("NUM_IDLE_PROCESSES"):
+            opts["num_idle_processes"] = int(os.environ["NUM_IDLE_PROCESSES"])
+        cli.run_app(WorkerOptions(**opts))

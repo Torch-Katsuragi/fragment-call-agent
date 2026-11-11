@@ -1,4 +1,4 @@
-# LiveKit server 設定 (M1 最小構成)
+# LiveKit server 設定 (M1 最小構成 + 2026-11-04 host network & calld webhook)
 port: 7880
 rtc:
   tcp_port: 7881
@@ -6,9 +6,13 @@ rtc:
   port_range_end: 50100
   use_external_ip: true
 redis:
-  address: redis:6379
+  address: 127.0.0.1:6379
 keys:
   # .env の LIVEKIT_API_KEY / SECRET と一致させる (compose では起動時に envsubst するか手動同期)
   devkey: svejj8xzIJQYUZEClrgPq2B48oXOLPaN3PzxuB6AEes
+webhook:
+  api_key: devkey
+  urls:
+    - http://127.0.0.1:8795/livekit_webhook
 logging:
   level: info

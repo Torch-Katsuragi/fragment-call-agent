@@ -9,7 +9,6 @@ import crypto from "node:crypto";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { pool } from "./db";
 import { atLeast, isRole, type Role } from "./roles";
-import { TENANT_ID, deviceTokenPrefix } from "./tenants";
 
 export type Member = { id: number; email: string; name: string; role: Role; status: string };
 export type Who = { member: Member; deviceId: string | null; via: "web" | "device" | "dev" };
@@ -109,8 +108,7 @@ export async function identifyDevice(token: string): Promise<Who | null> {
 // ---- 端末のログイン ----
 /** アプリの端末に新しいログインを渡す。同じ人の同じ端末の前のログインは切る */
 export async function createDeviceSession(memberId: number, deviceId: string): Promise<string> {
-  // 頭にテナントを入れる (main 以外は fr1_<id>_)。Caddy がこれを見て、端末の要求をテナントの管制室へ回す
-  const token = newToken(deviceTokenPrefix(TENANT_ID));
+  const token = newToken(DEVICE_PREFIX);
   await pool.query(
     "UPDATE device_sessions SET revoked_at = now() WHERE member_id = $1 AND device_id = $2 AND revoked_at IS NULL",
     [memberId, deviceId],

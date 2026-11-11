@@ -10,7 +10,6 @@ import MembersSettings from "@/components/MembersSettings";
 import ScheduleSettings from "@/components/ScheduleSettings";
 import SelfLabelSetting from "@/components/SelfLabelSetting";
 import RecordingSettings from "@/components/RecordingSettings";
-import { TENANT_ID, currentTenant, tenantsOfEmail } from "@/lib/tenants";
 
 export const metadata = { title: "設定 | フラグメント 管制室" };
 
@@ -23,8 +22,6 @@ export const metadata = { title: "設定 | フラグメント 管制室" };
 export default async function SettingsPage() {
   const session = await auth();
   const user = session?.user;
-  const current = currentTenant();
-  const mine = user?.email ? await tenantsOfEmail(user.email) : [];
 
   return (
     <div className="settings">
@@ -60,9 +57,7 @@ export default async function SettingsPage() {
         <div className="set-group">
           <div className="set-row">
             <div className="set-row-desc">
-              アプリは Google アカウントでログインします。新しい人は上の「メンバー」から招待してください。
-              1 つのアカウントで何台も入れた端末 (事務所の子機など) は、メンバー欄でその人の下に 1 台ずつ並び、
-              権限の上限を付けたり 1 台だけ止めたりできます。
+              アプリは Google アカウントでログインします。新しい人は上の「メンバー」から招待してください。同じアカウントで複数の端末からログインでき、着信の一時停止は各端末のアプリ側で切り替えられます。
             </div>
           </div>
         </div>
@@ -111,22 +106,6 @@ export default async function SettingsPage() {
       <section className="set-section">
         <h2 className="set-heading">アカウント</h2>
         <div className="set-group">
-          {/* 同居構成 (2026-10-04): いまどの管制室か。複数の管制室のメンバーなら切り替えられる */}
-          <div className="set-row inline">
-            <div className="set-row-text">
-              <div className="set-row-title">管制室</div>
-              <div className="set-row-desc">{current?.label ?? TENANT_ID}</div>
-            </div>
-            {mine.filter((t) => t.id !== TENANT_ID).map((t) => (
-              <a
-                key={t.id}
-                className="btn-quiet"
-                href={`/api/public/tenant?to=${encodeURIComponent(t.id)}&next=/`}
-              >
-                {t.label} へ切り替え
-              </a>
-            ))}
-          </div>
           {user ? (
             <div className="set-row inline">
               <div className="account-row">

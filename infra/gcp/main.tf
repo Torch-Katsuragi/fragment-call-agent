@@ -1,4 +1,12 @@
-# Call-Agent GCP インフラ (M1 最小構成)
+# Call-Agent GCP インフラ (GCE VM + VPC FW + Cloud DNS)
+#
+# 役割分担 (2026-11):
+#   - GCE VM (`call-agent`, e2-small): Asterisk・LiveKit・LiveKit SIP・PostgreSQL・hookd・calld・
+#     directory-agent・管制室 (Next.js)・Caddy を常駐稼働させる
+#   - Cloud Run (`call-agent-ai`, asia-northeast1): 音声 AI 本体 (AGENT_MODE=http)。
+#     Direct VPC Egress で同一 default VPC の VM 内部 IP (10.0.0.x: 7880 / 5432 / 8790) へ直結し、
+#     通話中のみ起動・課金される。Cloud Run 側のビルド・デプロイは `infra/scripts/deploy_cloud_agent.sh` で行う
+#
 # 使い方:
 #   gcloud auth application-default login
 #   terraform init && terraform apply -var project_id=<PROJECT_ID>
@@ -10,7 +18,7 @@ variable "region" {
 }
 variable "zone" {
   type    = string
-  default = "asia-northeast1-b"
+  default = "asia-northeast1-a"
 }
 
 provider "google" {
@@ -24,8 +32,10 @@ resource "google_compute_address" "call_agent" {
 }
 
 resource "google_compute_instance" "call_agent" {
-  name         = "call-agent"
-  machine_type = "e2-medium" # M2でAIパイプラインが載るので最初からmedium
+  name = "call-agent"
+  # 音声 AI 本体を Cloud Run (call-agent-ai) へ分離したことで VM 常駐メモリが約 1.15GB に収まったため
+  # e2-medium (4GB) から e2-small (2GB) へ縮小 (2026-11)
+  machine_type = "e2-small"
   zone         = var.zone
 
   boot_disk {
@@ -74,9 +84,9 @@ resource "google_compute_instance" "call_agent" {
 # AIが応答してAPI消費+OOMの一因になった実績がある (開発記録 2026-07-26)
 locals {
   carrier_sip_ranges = [
-    "202.173.5.181/32", # ブラステル My050 (pjsip.conf の brastel-identify と一致)
-    "54.172.60.0/30",   # Twilio Elastic SIP Trunking US1 signaling
-    "168.86.128.0/18",  # Twilio media (RTP)
+    "202.173.5.0/24",  # ブラステル My050 (SIP シグナリング + メディア帯域)
+    "54.172.60.0/30",  # Twilio Elastic SIP Trunking US1 signaling
+    "168.86.128.0/18", # Twilio media (RTP)
   ]
 }
 
@@ -124,7 +134,7 @@ resource "google_compute_firewall" "call_agent" {
   }
   allow {
     protocol = "udp"
-    ports    = ["10000-10500"] # RTP (SIP)
+    ports    = ["20000-20500"] # 外向き Asterisk RTP (rtp.conf と一致。10000-10500 は localhost 内の LiveKit SIP 用)
   }
 
   source_ranges = local.carrier_sip_ranges

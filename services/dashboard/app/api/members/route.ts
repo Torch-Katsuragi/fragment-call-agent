@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pool } from "@/lib/db";
 import { createInvite, hashToken, memberFromHeaders } from "@/lib/members";
-import { currentTenant } from "@/lib/tenants";
 import { mailEnabled, sendMail } from "@/lib/mail";
 import { atLeast, isRole, ROLE_LABEL } from "@/lib/roles";
 import { publicBase } from "@/lib/publicBase";
@@ -47,13 +46,10 @@ export async function POST(req: NextRequest) {
   }
   const token = await createInvite(email, role, me.id);
   const link = `${publicBase(req.nextUrl.origin)}/invite/${token}`;
-  // 管制室の名前を入れる (2026-10-04、同居構成)。どこからの招待か分からないと、受けた人が迷う
-  const place = currentTenant()?.label;
   const mailed = await sendMail(
     email,
-    place ? `フラグメント (${place}) への招待` : "フラグメントへの招待",
-    `${me.name || me.email || "フラグメントの管理者"} さんから、電話エージェント「フラグメント」` +
-      `${place ? `の「${place}」の管制室` : ""}に「${ROLE_LABEL[role]}」の権限で招待されました。\n\n` +
+    "フラグメントへの招待",
+    `${me.name || me.email || "フラグメントの管理者"} さんから、電話エージェント「フラグメント」の管制室に「${ROLE_LABEL[role]}」の権限で招待されました。\n\n` +
       `次のリンクを開き、このメールアドレス (${email}) の Google アカウントでログインしてください。` +
       `Android ではアプリが開きます。\n\n${link}\n\n` +
       `リンクは 7 日間有効です。心当たりがなければ、このメールは破棄してください。\n` +

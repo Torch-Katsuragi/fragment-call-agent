@@ -25,13 +25,10 @@ services:
     image: livekit/livekit-server:latest
     logging: *default-logging
     restart: unless-stopped
+    network_mode: host          # Direct VPC Egress (Cloud Run) に VM の内部 IP (10.0.0.x) を ICE 広告させる
     command: --config /etc/livekit.yaml
     volumes:
       - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
-    ports:
-      - "7880:7880"            # WebSocket / API
-      - "7881:7881"            # TCP fallback (WebRTC)
-      - "50000-50100:50000-50100/udp"  # WebRTC media (レンジは livekit.yaml と一致させる)
     depends_on:
       - redis
 
@@ -52,6 +49,8 @@ services:
         # Asterisk 仲介構成では LiveKit SIP は常に localhost の Asterisk としか話さない。
         # 外部IPを名乗るとヘアピンで死ぬ (2026-07-15) — 対外NATは Asterisk 側の仕事
         use_external_ip: false
+        # WebRTC(Android/Opus DTX) -> SIP(RTP) のジッタ・間隔揺らぎで mixer.restarts が多発するのを防ぐ
+        enable_jitter_buffer: true
     depends_on:
       - livekit
       - redis
@@ -65,7 +64,11 @@ services:
       POSTGRES_PASSWORD: callagent   # ローカル専用。GCP常駐化の際に見直す
       POSTGRES_DB: callagent
     ports:
-      - "127.0.0.1:5432:5432"        # ホストで動く dashboard (Next.js) から接続する
+      # ⚠既定は 127.0.0.1: Docker のポート公開は ufw をバイパスするため、クラウド FW の無い VPS 等で
+      #   0.0.0.0 にすると DB がインターネットへ露出する。GCP でホストの dashboard (127.0.0.1) と
+      #   Cloud Run Direct VPC Egress (10.0.0.x) の両方から繋ぐ場合のみ、VPC FW で外部からの 5432 を
+      #   遮断したうえで .env に PG_BIND_IP=0.0.0.0 を設定する
+      - "${PG_BIND_IP:-127.0.0.1}:5432:5432"
     volumes:
       # named volume を使う (バインドマウントだと /mnt/c の drvfs が chmod 不可で initdb が失敗する — 2026-07-16実測)。
       # compose down では消えない。消すには docker volume rm infra_callagent-pgdata
@@ -82,13 +85,19 @@ services:
     ports:
       - "127.0.0.1:50021:50021"   # ホストから話者一覧の確認・試聴用 (curl localhost:50021/speakers)
 
+  # 応対 AI ワーカー (ローカル常駐時のみ --profile local-agent で起動)。
+  # Cloud Run ハイブリッド構成 (CLOUD_AGENT_URL=https://...) では VM 上で起動しない —
+  # 起動すると Cloud Run と同じ LiveKit ルームに二重入室し、メモリも約 450MB 消費する
   agent:
     build: ../services/agent
+    profiles: ["local-agent"]
     logging: *default-logging
     restart: unless-stopped
     environment:
+      AGENT_MODE: ${AGENT_MODE:-worker}
+      ENABLE_JSONL_BACKUP: ${ENABLE_JSONL_BACKUP:-1}
       OWNER_NAME: ${OWNER_NAME:-}   # 本人の呼び名 (AI への指示文・相手役のセリフ)。氏名をソースに書かないため .env から
-      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_URL: ws://host.docker.internal:7880
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
       # ⚠取り次ぎ (request_handoff) の宛先。コード既定の host.docker.internal は
@@ -99,10 +108,8 @@ services:
       HOOKD_URL: http://hookd:8790
       # M2: AIコア (AI_CORE=live がデフォルト。cascade は賢いが遅い)
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
-      # AI の請求先 (2026-10-08、services/agent/vertex.py)。あれば Vertex AI (VM のサービスアカウントで認証)。
-      # テナントごとの請求先は <ID>_VERTEX_PROJECT (無ければ VERTEX_PROJECT のまま)
+      # AI の請求先 (2026-10-08、services/agent/vertex.py)。あれば Vertex AI (VM のサービスアカウントで認証)
       VERTEX_PROJECT: ${VERTEX_PROJECT:-}
-      KUMIAI_VERTEX_PROJECT: ${KUMIAI_VERTEX_PROJECT:-}
       DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY}
       ELEVEN_API_KEY: ${ELEVEN_API_KEY}
       AI_CORE: ${AI_CORE:-live}
@@ -158,18 +165,15 @@ services:
       SECURITY_RATE_MAX: ${SECURITY_RATE_MAX:-5}
       SECURITY_RATE_WINDOW_SEC: ${SECURITY_RATE_WINDOW_SEC:-600}
       SECURITY_BLOCK_SEC: ${SECURITY_BLOCK_SEC:-3600}
-      # テナント (管制室) の台帳 (2026-10-04)。agent は全テナントで共有し、通話ごとに部屋名の頭で
-      # テナントを決めてその DB・作業フォルダ・hookd に切り替える (services/agent/tenants.py)
-      TENANTS_FILE: /tenant-registry/tenants.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ../data:/data
       - ./secrets:/secrets:ro
       # 応対プロンプトのmdを読むため (読み取り専用。書くのは管制室=ホスト側)
       - ${FRAGMENT_WORKSPACE_HOST:-/srv/fragment/workspace}:/fragment:ro
-      # ⚠台帳はディレクトリごとマウントする (単一ファイルだと差し替えに追従しない)
-      - ./tenants:/tenant-registry:ro
-      # main 以外のテナントの作業フォルダ (/tenants/<id>/workspace)
-      - ${TENANTS_HOST:-/home/fragment/tenants}:/tenants:ro
+    ports:
+      - "127.0.0.1:8080:8080"
     depends_on:
       - livekit
       - postgres
@@ -192,28 +196,32 @@ services:
     command: python caller_sim.py start
     environment:
       OWNER_NAME: ${OWNER_NAME:-}   # 本人の呼び名 (AI への指示文・相手役のセリフ)。氏名をソースに書かないため .env から
-      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_URL: ws://host.docker.internal:7880
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
       GOOGLE_TTS_CREDENTIALS: /secrets/callagent-tts.json
       SIM_VOICE: ${SIM_VOICE:-ja-JP-Chirp3-HD-Charon}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./secrets:/secrets:ro
     depends_on:
       - livekit
 
-  # 着信フックAPI (Asteriskが INVITE 到着の瞬間に叩く → 下調べジョブ投入)。
-  # agent と同じイメージで command だけ差し替え。Asterisk は host network なので
-  # WSL2 の 127.0.0.1:8790 に公開する
+  # 着信フックAPI (Asteriskが INVITE 到着の瞬間に叩く → 下調べジョブ投入 + 先行起動)。
+  # 軽量な Dockerfile.hookd でビルドし、agent のデプロイや重い依存から切り離す (2026-11-04)
   hookd:
-    build: ../services/agent
+    build:
+      context: ../services/agent
+      dockerfile: Dockerfile.hookd
     logging: *default-logging
     restart: unless-stopped
     command: python hookd.py
     environment: &hookd-env
       FRAGMENT_WORKSPACE: /fragment
       DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent
+      CALLD_URL: http://calld:8795
       # スタンバイで端末を鳴らす秒数。⚠asterisk 側 (ダイヤルプランの ENV) と同じ値を渡す (2026-09-18)
       STANDBY_RING_SEC: ${STANDBY_RING_SEC:-2}
       # 電話帳で「人が出る」にした相手を鳴らす秒数 (2026-09-30)。⚠asterisk と hookd で揃える
@@ -223,7 +231,7 @@ services:
       VERTEX_PROJECT: ${VERTEX_PROJECT:-}
       RANK_MODEL: ${RANK_MODEL:-gemini-3.8-flash}
       # テスト通話シミュレータがルーム作成+caller-simディスパッチに使う
-      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_URL: ws://host.docker.internal:7880
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
       # 発信 (/dial): Asterisk は host network なので host-gateway 経由で AMI に届く
@@ -259,40 +267,37 @@ services:
       # 電話帳の `応答:` (相手ごとの応答、2026-09-30) を読む。読み取り専用
       - ${FRAGMENT_WORKSPACE_HOST:-/srv/fragment/workspace}:/fragment:ro
     ports:
-      - "127.0.0.1:8790:8790"
+      # ⚠既定は 127.0.0.1: 外部へ露出すると /dial (AMI 発信) 等を悪用され得る。
+      #   Asterisk・dashboard (127.0.0.1) と Cloud Run Direct VPC Egress (10.0.0.x) を併用する場合のみ、
+      #   VPC FW で外部からの 8790 を遮断したうえで .env に HOOKD_BIND_IP=0.0.0.0 を設定する
+      - "${HOOKD_BIND_IP:-127.0.0.1}:8790:8790"
     depends_on:
       - postgres
 
-  # ---- 2 つ目のテナントの管制室の hookd (2026-10-04、同居構成) ----
-  # hookd はテナントごとに 1 つ。設定は main の hookd を引き継ぎ、違うところだけ上書きする。
-  # 台帳は infra/tenants/tenants.json (ポート・部屋名の頭・DB・作業フォルダを揃えること)
-  hookd-kumiai:
-    build: ../services/agent
+  # ---- Cloud Run (HTTP モード) のディスパッチ・HTTP保持・死活監視デーモン (2026-11-04) ----
+  # CLOUD_AGENT_URL が設定されているときだけ HTTP モードでディスパッチする (空なら待機のみ)
+  calld:
+    build:
+      context: ../services/agent
+      dockerfile: Dockerfile.hookd
     logging: *default-logging
     restart: unless-stopped
-    command: python hookd.py
+    command: python calld.py
     environment:
-      <<: *hookd-env
-      HOOKD_PORT: "8791"
-      ROOM_PREFIX: kumiai
-      FRAGMENT_WORKSPACE: /tenants/kumiai/workspace
-      DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent_kumiai
-      # テナントの回線 (Twilio、テナントの契約) からテナントの番号で出る
-      OUTBOUND_TRUNK: twilio-kumiai
-      OUTBOUND_CONTEXT: outbound-bridge-kumiai
-      OUTBOUND_CALLERID: ${KUMIAI_OUTBOUND_CALLERID:-}
-      SECURITY_LOCAL_NUMBERS: ${KUMIAI_SECURITY_LOCAL_NUMBERS:-}
-      SECURITY_ALLOW_NUMBERS: ${KUMIAI_SECURITY_ALLOW_NUMBERS:-}
-      SECURITY_WEBHOOK_URL: ${KUMIAI_SECURITY_WEBHOOK_URL:-}
-      # テナントの AI はテナントの GCP プロジェクトの請求で (2026-10-08)。無ければ main と同じ
-      VERTEX_PROJECT: ${KUMIAI_VERTEX_PROJECT:-${VERTEX_PROJECT:-}}
+      FRAGMENT_WORKSPACE: /fragment
+      DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent
+      LIVEKIT_URL: ws://host.docker.internal:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      CLOUD_AGENT_URL: ${CLOUD_AGENT_URL:-}
+      CLOUD_AGENT_IAM_AUTH: ${CLOUD_AGENT_IAM_AUTH:-1}
+      CALLD_PORT: "8795"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./secrets:/secrets:ro
-      - ${TENANTS_HOST:-/home/fragment/tenants}/kumiai/workspace:/tenants/kumiai/workspace:ro
+      - ${FRAGMENT_WORKSPACE_HOST:-/srv/fragment/workspace}:/fragment:ro
     ports:
-      - "127.0.0.1:8791:8791"
+      - "127.0.0.1:8795:8795"
     depends_on:
       - postgres
 
@@ -330,28 +335,6 @@ services:
     depends_on:
       - postgres
 
-  # ---- 2 つ目のテナントの管制室の後方支援 (2026-10-04、同居構成) ----
-  directory-agent-kumiai:
-    build: ../services/directory-agent
-    profiles: ["vm-worker"]
-    logging: *default-logging
-    restart: unless-stopped
-    user: "${WORKSPACE_UID:-1000}:${WORKSPACE_GID:-1003}"
-    environment:
-      <<: *worker-env
-      # ⚠ユーザーの氏名をテナントに持ち込まない。テナントの名乗りはテナントの管制室の設定 (self_label)
-      OWNER_NAME: ${KUMIAI_OWNER_NAME:-}
-      DATABASE_URL: postgresql://callagent:callagent@postgres:5432/callagent_kumiai
-      FRAGMENT_WORKSPACE: /tenants/kumiai/workspace
-      HOOKD_URL: http://hookd-kumiai:8791
-      VERTEX_PROJECT: ${KUMIAI_VERTEX_PROJECT:-${VERTEX_PROJECT:-}}
-    volumes:
-      - ${TENANTS_HOST:-/home/fragment/tenants}/kumiai/workspace:/tenants/kumiai/workspace
-      # テナントの通話の生の録音 (Asterisk が data/recordings/kumiai/ に書く)
-      - ../data/recordings/kumiai:/recordings
-    depends_on:
-      - postgres
-
   # ---- フォールバック: REGISTER 仲介 (M1検証で必要と判断した場合のみ) ----
   asterisk:
     image: andrius/asterisk:20
@@ -369,8 +352,6 @@ services:
       STANDBY_RING_SEC: ${STANDBY_RING_SEC:-2}
       # 電話帳で「人が出る」にした相手を鳴らす秒数 (2026-09-30)。⚠asterisk と hookd で揃える
       PRIORITY_RING_SEC: ${PRIORITY_RING_SEC:-20}
-      # 2 つ目のテナントの番号 (Twilio から届く宛先、+81… の形)。この宛先の着信はテナントの管制室へ (2026-10-04)
-      KUMIAI_DID: ${KUMIAI_DID:-}
     volumes:
       - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
       - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro

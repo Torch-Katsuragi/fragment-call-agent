@@ -15,26 +15,8 @@
     header_up X-Forwarded-For {remote_host}
 }
 
-# 同居構成 (2026-10-04): 管制室はテナントごとに別プロセスで、入口はこの 1 つ。行き先は
-#   ・ブラウザ … Cookie fr_tenant=<id> (ログイン時と切り替えで管制室が付ける、/api/public/tenant)
-#   ・アプリ   … 端末のトークンの頭 fr1_<id>_ (Authorization: Bearer)
-#   どれにも当たらなければ main (ユーザー本人の管制室、3000)。ポートは infra/tenants/tenants.json の dashboard_port
-# ⚠振り分けは「どの管制室に行くか」だけ。入れるかは行き先がメンバー表で毎回判定する
+# 管制室は 1 VM = 1 サービス (localhost:3000)
 (dashboard) {
-    @kumiai {
-        header_regexp kc Cookie (^|;\s*)fr_tenant=kumiai(;|$)
-    }
-    @kumiai_device_bearer header_regexp kb Authorization ^Bearer\s+fr1_kumiai_
-    handle @kumiai_device_bearer {
-        reverse_proxy localhost:3001 {
-            import fwd
-        }
-    }
-    handle @kumiai {
-        reverse_proxy localhost:3001 {
-            import fwd
-        }
-    }
     handle {
         reverse_proxy localhost:3000 {
             import fwd

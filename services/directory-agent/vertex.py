@@ -35,6 +35,22 @@ def live_location() -> str:
     return os.environ.get("VERTEX_LIVE_LOCATION", "us-central1")
 
 
+# Vertex AI は gemini-flash-latest 等の -latest エイリアスが 404 になるため、
+# VERTEX_PROJECT 使用時は対応する最新明示モデルへ自動変換する (2026-11-09 実測)
+_VERTEX_LATEST_MAP = {
+    "gemini-flash-latest": "gemini-3.8-flash",
+    "gemini-flash-lite-latest": "gemini-3.5-flash-lite",
+    "gemini-pro-latest": "gemini-4-argon",
+}
+
+
+def resolve_model(model: str) -> str:
+    """AI Studio では -latest エイリアスをそのまま使い、Vertex AI では明示モデルへ解決する"""
+    if project():
+        return _VERTEX_LATEST_MAP.get(model, model)
+    return model
+
+
 def token() -> str:
     """VM のサービスアカウントのアクセストークン (切れる 5 分前まで使い回す)。⚠同期で呼ぶ"""
     global _token
@@ -56,7 +72,13 @@ def url(path: str) -> str:
     if path.startswith("projects/"):
         return f"https://aiplatform.googleapis.com/v1/{path}"
     if path.startswith("models/"):
-        path = "publishers/google/" + path
+        rest = path[len("models/") :]
+        if ":" in rest:
+            m, action = rest.split(":", 1)
+            rest = f"{resolve_model(m)}:{action}"
+        else:
+            rest = resolve_model(rest)
+        path = "publishers/google/models/" + rest
     return f"https://aiplatform.googleapis.com/v1/projects/{p}/locations/{location()}/{path}"
 
 
@@ -65,7 +87,7 @@ def model_name(model: str) -> str:
     p = project()
     if not p:
         return f"models/{model}"
-    return f"projects/{p}/locations/{location()}/publishers/google/models/{model}"
+    return f"projects/{p}/locations/{location()}/publishers/google/models/{resolve_model(model)}"
 
 
 def headers() -> dict[str, str]:

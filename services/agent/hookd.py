@@ -65,6 +65,36 @@ def _prune() -> None:
         del HANDOFF[k]
 
 
+async def _notify_calld_warmup(reason: str) -> None:
+    """calld 経由で Cloud Run の先行起動 (/warmup) を非同期発火する (2026-11-04)。
+    calld 未起動 (ワーカーモード) の場合は静かに無視する。"""
+    calld_url = os.environ.get("CALLD_URL", "").strip().rstrip("/")
+    if not calld_url:
+        return
+    try:
+        timeout = aiohttp.ClientTimeout(total=2.0, sock_connect=1.0)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.post(f"{calld_url}/warmup?reason={reason}"):
+                pass
+    except Exception:
+        pass
+
+
+async def ai_ready(_req: web.Request) -> web.Response:
+    """extensions.conf の aidial 直前チェック。calld が応答不能と明示したときだけ 'no' を返す。"""
+    calld_url = os.environ.get("CALLD_URL", "").strip().rstrip("/")
+    if not calld_url:
+        return web.Response(text="ok")
+    try:
+        timeout = aiohttp.ClientTimeout(total=2.0, sock_connect=1.0)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(f"{calld_url}/ai_ready") as r:
+                txt = (await r.text()).strip()
+                return web.Response(text="no" if txt == "no" else "ok")
+    except Exception:
+        return web.Response(text="ok")
+
+
 async def prefetch(req: web.Request) -> web.Response:
     number = req.query.get("number", "")
     if not re.fullmatch(r"[+0-9]{4,20}", number):
@@ -191,6 +221,8 @@ async def ringing_start(req: web.Request) -> web.Response:
         # ⚠await しない — ダイヤルプランはこの応答を待ってから鳴らし始める
         if ring_sec > 0:
             asyncio.create_task(push.wake(req.app["pool"], "ring", exclude=quiet))
+        if mode != "manual":
+            asyncio.create_task(_notify_calld_warmup("ringing_start"))
     return web.Response(text="ok")
 
 
@@ -674,6 +706,7 @@ async def simulate_call(req: web.Request) -> web.Response:
     number = re.sub(r"[^\d+]", "", req.query.get("number", ""))
     if number and not re.fullmatch(r"\+?[0-9]{6,20}", number):
         return web.json_response({"ok": False, "error": "番号の形式が不正です"}, status=400)
+    asyncio.create_task(_notify_calld_warmup("simulate_call"))
     asyncio.create_task(_run_sim_call(req.app["pool"], scenario, number))
     return web.json_response({"ok": True, "number": number or SIM_NUMBER})
 
@@ -824,6 +857,7 @@ async def dial(req: web.Request) -> web.Response:
     )
     await _prefetch_jobs(pool, number)  # 発信でも下調べ (電話帳+過去通話+番号検索) を回す
     DIALING[number] = {"status": "dialing", "since": time.time(), "reason": ""}
+    asyncio.create_task(_notify_calld_warmup("dial"))
     asyncio.create_task(_run_originate(number))
     log.info("dial: %s", number)
     return web.json_response({"ok": True, "number": number})
@@ -978,6 +1012,7 @@ async def make_app() -> web.Application:
     app.router.add_get("/transfer_candidates", transfer_candidates)
     app.router.add_get("/screen", screen)
     app.router.add_get("/guard", guard)
+    app.router.add_get("/ai_ready", ai_ready)
     app.router.add_get("/simulate_call", simulate_call)
     app.router.add_get("/dial", dial)
     app.router.add_get("/outbound_answered", outbound_answered)
@@ -988,5 +1023,5 @@ async def make_app() -> web.Application:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    # テナントごとに 1 つ (2026-10-04)。ポートは infra/tenants/tenants.json の hookd_host_port と揃える
+    # Asterisk ダイヤルプラン・端末・Cloud Run の仲介 HTTP サーバー (既定 8790)
     web.run_app(make_app(), host="0.0.0.0", port=int(os.environ.get("HOOKD_PORT") or "8790"))

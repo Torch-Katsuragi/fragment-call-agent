@@ -67,7 +67,7 @@ if [ -z "$targets" ]; then
     # ⚠hookd.py と security.py は services/agent/ に置かれているが、動いているのは
     #   別コンテナ (infra-hookd-1)。agent だけ再起動して hookd が古いまま、を実際に踏んだ
     # ⚠hookd が import しているもの (presence.py は起動時に DDL を流す、push.py) も (2026-09-26 に列が入らず踏んだ)
-    case "$CHANGED" in *services/agent/hookd.py*|*services/agent/security.py*|*services/agent/presence.py*|*services/agent/members.py*|*services/agent/push.py*|*services/agent/schedule.py*|*services/agent/requirements.txt*|*infra/docker-compose.yml*) targets="$targets hookd";; esac
+    case "$CHANGED" in *services/agent/hookd.py*|*services/agent/calld.py*|*services/agent/workspace_config.py*|*services/agent/security.py*|*services/agent/presence.py*|*services/agent/members.py*|*services/agent/push.py*|*services/agent/schedule.py*|*services/agent/requirements*.txt*|*services/agent/Dockerfile.hookd*|*infra/docker-compose.yml*) targets="$targets hookd";; esac
     case "$CHANGED" in *infra/asterisk/*) targets="$targets asterisk";; esac
     case "$CHANGED" in *services/directory-agent/*) targets="$targets worker";; esac
   fi
@@ -103,7 +103,7 @@ if [ \"\$t\" != \"\${t/ asterisk /}\" ]; then
   # ⚠ docker restart ではなく compose で作り直す (2026-09-18)。restart は古い environment を
   #   引きずるので、docker-compose.yml に足した環境変数 (STANDBY_RING_SEC) がコンテナに入らず、
   #   ダイヤルプランが空の秒数で走った。作り直しなら env も bind も新しくなる
-  (cd infra && sudo docker compose --env-file ../.env --profile asterisk --profile vm-worker --profile testcall up -d --force-recreate asterisk 2>&1 | tail -1)
+  (cd infra && sudo docker compose --env-file ../.env --profile asterisk --profile vm-worker up -d --force-recreate asterisk 2>&1 | tail -1)
   sleep 10
   # ⚠マウント越しに中身が本当に入れ替わったかを突き合わせる (今日ここで騙された)
   for f in extensions.conf rtp.conf musiconhold.conf; do
@@ -114,17 +114,30 @@ if [ \"\$t\" != \"\${t/ asterisk /}\" ]; then
 fi
 
 svc=''
-[ \"\$t\" != \"\${t/ agent /}\" ] && svc=\"\$svc agent\"
-# ⚠テナントごとの hookd・worker (hookd-kumiai 等、2026-10-04 の同居構成) も同じコードなので一緒に作り直す
-[ \"\$t\" != \"\${t/ hookd /}\" ] && svc=\"\$svc hookd \$(cd infra && sudo docker compose --profile vm-worker config --services 2>/dev/null | grep '^hookd-' | tr '\n' ' ')\"
-[ \"\$t\" != \"\${t/ worker /}\" ] && svc=\"\$svc directory-agent \$(cd infra && sudo docker compose --profile vm-worker config --services 2>/dev/null | grep '^directory-agent-' | tr '\n' ' ')\"
+agent_profile=''
+cloud_url=\$(grep -E '^CLOUD_AGENT_URL=' .env 2>/dev/null | cut -d= -f2- | tr -d '\"'\''\r ' || true)
+if [ \"\$t\" != \"\${t/ agent /}\" ]; then
+  case \"\$cloud_url\" in
+    https://*)
+      echo '--- agent: CLOUD_AGENT_URL が Cloud Run を指しているため VM 側の agent 再ビルドはスキップ ---'
+      sudo docker rm -f infra-agent-1 >/dev/null 2>&1 || true
+      ;;
+    *)
+      svc=\"\$svc agent\"
+      agent_profile='--profile local-agent'
+      ;;
+  esac
+fi
+[ \"\$t\" != \"\${t/ hookd /}\" ] && svc=\"\$svc hookd calld\"
+[ \"\$t\" != \"\${t/ worker /}\" ] && svc=\"\$svc directory-agent\"
 if [ -n \"\$svc\" ]; then
   echo \"--- 再ビルド:\$svc ---\"
-  (cd infra && sudo docker compose --env-file ../.env --profile asterisk --profile vm-worker --profile testcall up -d --build \$svc 2>&1 | tail -3)
+  (cd infra && sudo docker compose --env-file ../.env --profile asterisk --profile vm-worker \$agent_profile up -d --build --remove-orphans \$svc 2>&1 | tail -3)
   sleep 8
-  # ⚠コンテナ名とファイルの対応。hookd.py は services/agent/ にあるが別コンテナで動く
-  [ \"\$t\" != \"\${t/ agent /}\" ] && check=\"\$check infra-agent-1:/app/agent.py:services/agent/agent.py\"
-  [ \"\$t\" != \"\${t/ hookd /}\" ] && check=\"\$check infra-hookd-1:/app/hookd.py:services/agent/hookd.py\"
+  # ⚠コンテナ名とファイルの対応。hookd.py / calld.py は services/agent/ にあるが別コンテナで動く
+  check=''
+  case \" \$svc \" in *' agent '*) check=\"\$check infra-agent-1:/app/agent.py:services/agent/agent.py\";; esac
+  [ \"\$t\" != \"\${t/ hookd /}\" ] && check=\"\$check infra-hookd-1:/app/hookd.py:services/agent/hookd.py infra-calld-1:/app/calld.py:services/agent/calld.py\"
   for pair in \$check; do
     cont=\${pair%%:*}; rest=\${pair#*:}; cpath=\${rest%%:*}; hpath=\${rest#*:}
     h=\$(md5sum \$hpath | cut -d' ' -f1)
@@ -143,7 +156,7 @@ if [ \"\$t\" != \"\${t/ dashboard /}\" ]; then
   # ⚠install を忘れると package.json に依存を足したデプロイでビルドが壊れる
   #   (qrcode 追加 2026-08-01 が最初の該当)。依存に変化が無ければ一瞬で終わる
   (cd services/dashboard && npm install --no-audit --no-fund 2>&1 | tail -1 && npm run build 2>&1 | tail -3)
-  # テナントごとの管制室 (call-agent-dashboard-kumiai 等、2026-10-04) も同じビルドなので全部再起動する
+  # 管制室の systemd ユニットを再起動する
   units=\$(systemctl list-units --all --plain --no-legend 'call-agent-dashboard*' | awk '{print \$1}')
   sudo systemctl restart \$units
   sleep 4

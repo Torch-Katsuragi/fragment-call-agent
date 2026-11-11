@@ -1,7 +1,6 @@
 import { redirect } from "next/navigation";
 import { auth, signIn, signOut } from "@/auth";
-import { acceptInvite, hashToken, openInvite } from "@/lib/members";
-import { TENANT_ID, tenantOfInvite } from "@/lib/tenants";
+import { acceptInvite, openInvite } from "@/lib/members";
 import { ROLE_LABEL } from "@/lib/roles";
 import { publicBase } from "@/lib/publicBase";
 
@@ -17,13 +16,6 @@ export const metadata = { title: "招待 | フラグメント" };
 export default async function InvitePage({ params }: { params: Promise<{ token: string }> }) {
   const { token } = await params;
   const inv = await openInvite(token);
-  if (!inv) {
-    // 同居構成 (2026-10-04): 他の管制室の招待なら、そちらへ回す (Cookie を付け替えて同じページを開き直す)
-    const owner = await tenantOfInvite(hashToken(token));
-    if (owner && owner.id !== TENANT_ID) {
-      redirect(`/api/public/tenant?to=${encodeURIComponent(owner.id)}&next=${encodeURIComponent(`/invite/${token}`)}`);
-    }
-  }
   const session = await auth();
   const email = session?.user?.email?.toLowerCase() ?? "";
   const base = publicBase("");

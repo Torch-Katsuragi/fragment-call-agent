@@ -2,7 +2,6 @@ import NextAuth from "next-auth";
 import Google from "next-auth/providers/google";
 import { pool } from "@/lib/db";
 import { hasOpenInviteFor, memberByEmail } from "@/lib/members";
-import { TENANT_ID, tenantsOfEmail } from "@/lib/tenants";
 
 // 管制室に Google でログインしてよいのは、メンバー表 (lib/members.ts) にいる人と、招待を受けに来た人だけ
 // (2026-09-26。それまでは ALLOWED_EMAILS の固定リスト。今は ALLOWED_EMAILS は最初のオーナーの種)。
@@ -35,8 +34,7 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       }
       // メンバーでなくても、そのアドレス宛ての招待があれば通す (招待のページで受ける)
       if (await hasOpenInviteFor(email)) return true;
-      // 同居構成 (2026-10-04): 他の管制室のメンバーなら通す。middleware がその管制室へ回す
-      return (await tenantsOfEmail(email)).some((t) => t.id !== TENANT_ID);
+      return false;
     },
   },
   pages: {
