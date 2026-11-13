@@ -24,6 +24,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -50,11 +52,13 @@ WORKSPACE = Path(
     os.environ.get("FRAGMENT_WORKSPACE", r"./workspace")
 )
 BACKEND = os.environ.get("DIRECTORY_AGENT_BACKEND", "auto")
-# ⚠Google の最新 Flash に追従する方針 (2026-09-25 ユーザー「言わなくてもまめにアプデ」)。
-#   AI Studio は gemini-flash-latest、Vertex AI は vertex.py が gemini-3.8-flash に解決する (2026-11-09)。
-#   Flash-Lite は1.5秒だが地元の番号を全部「不明」にしたので速さのためには下げない
+# ⚠Google の最新モデルに追従しつつ、用途ごとに速度・精度・単価の最適モデルを使い分ける (2026-11-13):
+#   - GEMINI_MODEL (既定 3.8-flash): 着信鳴動中の番号 web 検索 (lookup_number)。受話前の 5〜8 秒が効くため高速優先
+#   - HYDROGEN_MODEL (既定 gemini-4-hydrogen): 会話監視 (Interactions API + 暗黙キャッシュ 95% 割引・保存料ゼロ)、
+#       終話要約、後方支援 QA、下調べ凝縮、ふりがな補完。ハルシネーションが大幅に減り、12/1 の Argon 値上げ後も安価
+#   - PRO_MODEL (既定 gemini-4-argon): 終話後のステレオ録音全文清書のみ。下書きアンカー付きの聴き直し精度が最良
 GEMINI_MODEL = os.environ.get("DIRECTORY_AGENT_MODEL", "gemini-flash-latest")
-# 終話後の録音全文清書は精度最優先で Pro (Vertex AI では gemini-4-argon に解決) を使う (2026-11-09)
+HYDROGEN_MODEL = os.environ.get("DIRECTORY_AGENT_HYDROGEN_MODEL", "gemini-4-hydrogen")
 PRO_MODEL = os.environ.get("DIRECTORY_AGENT_PRO_MODEL", "gemini-pro-latest")
 # 取り次ぎ要求の宛先 (判断層のOR発火)。ホスト実行時はhookdの公開ポート、
 # コンテナ実行時はcomposeが HOOKD_URL=http://hookd:8790 を注入する。
@@ -126,6 +130,24 @@ def gather_workspace(max_chars: int = 40000) -> str:
     return "\n".join(parts)
 
 
+def _build_gen_config(
+    target_model: str,
+    *,
+    json_mode: bool = False,
+    json_schema: dict | None = None,
+    thinking_level: str = "low",
+) -> dict:
+    cfg: dict = {"thinkingConfig": {"thinkingLevel": thinking_level}}
+    # Gemini 4 系は temperature / top_p / top_k が非推奨・無視されるため送らない (2026-11-13)
+    if not vertex.is_gemini4(target_model):
+        cfg["temperature"] = 0.3
+    if json_mode or json_schema is not None:
+        cfg["responseMimeType"] = "application/json"
+    if json_schema is not None:
+        cfg["responseJsonSchema"] = json_schema
+    return cfg
+
+
 def call_gemini(
     system_prompt: str,
     user_text: str,
@@ -133,19 +155,28 @@ def call_gemini(
     google_search: bool = False,
     cached: str | None = None,
     use_pro: bool = False,
+    *,
+    model: str | None = None,
+    json_schema: dict | None = None,
+    thinking_level: str | None = None,
 ) -> str:
     # ⚠thinkingBudget:0 は使わない (2026-08-01)。3.5では黙って無視されていたが、
     #   **3.6は400で拒否する** — このワンパラメータでworkerのGemini呼び出しが全滅し、
     #   下調べ・番号web検索・吹き出し・後方支援メモ・取り次ぎ判断が全部沈黙した。
     #   agent側は7/18に thinking_level へ直していて (同じ罠のSDK側)、こちらはREST残存だった。
     #   thinkingLevel:"low"+json_mode / +google_search の併用可はREST実測済み (200)
-    gen_cfg: dict = {"temperature": 0.3, "thinkingConfig": {"thinkingLevel": "low"}}
-    if json_mode:
-        gen_cfg["responseMimeType"] = "application/json"
-    body = {
+    # 2026-11-13: テキスト系の高精度呼び出し (use_pro=True: 後方支援QA・終話要約) は
+    #   gemini-4-hydrogen を標準にする (Argon は終話後の録音全文清書専用)
+    primary = model or (HYDROGEN_MODEL if (use_pro and not cached) else GEMINI_MODEL)
+    lvl = thinking_level or (
+        "medium" if (google_search and vertex.is_gemini4(primary)) else "low"
+    )
+    body: dict = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-        "generationConfig": gen_cfg,
+        "generationConfig": _build_gen_config(
+            primary, json_mode=json_mode, json_schema=json_schema, thinking_level=lvl
+        ),
     }
     if cached:
         # 明示キャッシュ (指示文と前半は登録済み)。⚠system_instruction は併記できない
@@ -154,13 +185,16 @@ def call_gemini(
     if google_search:
         # Google検索グラウンディング (⚠json_modeとは併用不可)
         body["tools"] = [{"google_search": {}}]
-    primary = PRO_MODEL if (use_pro and not cached) else GEMINI_MODEL
     used_model = primary
     try:
         data = _gemini_rest("POST", f"models/{primary}:generateContent", body, timeout=60)
     except Exception:
         used_model = GEMINI_MODEL if primary != GEMINI_MODEL else "gemini-3.8-flash"
-        data = _gemini_rest("POST", f"models/{used_model}:generateContent", body, timeout=60)
+        fb_body = dict(body)
+        fb_body["generationConfig"] = _build_gen_config(
+            used_model, json_mode=json_mode or (json_schema is not None), thinking_level="low"
+        )
+        data = _gemini_rest("POST", f"models/{used_model}:generateContent", fb_body, timeout=60)
     # 使った量を残す (2026-10-02、費用の内訳を測るため)。cached = 暗黙キャッシュに当たった分 (安い)
     u = data.get("usageMetadata") or {}
     log.info(
@@ -237,12 +271,30 @@ DIGEST_PROMPT = """電話の管制室に浮かべる「相手の下調べ」カ�
 出力JSON: {"title": "📇 相手の名前や正体 (12字程度)", "text": "考察 2〜4文。関係・直近のやりとり・注意点"}"""
 
 
+DIGEST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "text": {"type": "string"},
+    },
+    "required": ["title", "text"],
+}
+
+
 def digest_intro(raw: str, lookup: str | None, number: str) -> tuple[str, str]:
     user = (
         f"# 番号\n{number}\n\n# 電話帳メモと直近の通話\n{raw}\n\n"
         f"# 番号のweb検索結果\n{lookup or '(なし)'}"
     )
-    data = json.loads(call_gemini(DIGEST_PROMPT, user, json_mode=True))
+    data = parse_json_object(
+        call_gemini(
+            DIGEST_PROMPT,
+            user,
+            json_mode=True,
+            model=HYDROGEN_MODEL,
+            json_schema=DIGEST_SCHEMA,
+        )
+    )
     title = str(data.get("title") or "📇 相手の下調べ").strip()[:40]
     text = str(data.get("text") or "").strip() or raw[:400]
     return title, text
@@ -263,6 +315,13 @@ KANA_PROMPT = """日本人の名前 (または店・会社の名前) の読み�
 出力JSON: {"kana": "..."}"""
 
 
+KANA_SCHEMA = {
+    "type": "object",
+    "properties": {"kana": {"type": "string"}},
+    "required": ["kana"],
+}
+
+
 def fill_phonebook_kana() -> None:
     """読みがなの無い電話帳md に kana を補う (1 回 1 件、2026-09-26)。アプリの電話帳の並び順に使う。
     ⚠スマホの連絡先から登録したものは連絡先のふりがなが入っているので、ここに来るのはそれ以外
@@ -277,7 +336,14 @@ def fill_phonebook_kana() -> None:
         if not name or name == "不明" or re.search(r"^kana:", md, re.M):
             continue
         try:
-            kana = str(json.loads(call_gemini(KANA_PROMPT, name, json_mode=True)).get("kana") or "").strip()
+            raw_kana = call_gemini(
+                KANA_PROMPT,
+                name,
+                json_mode=True,
+                model=HYDROGEN_MODEL,
+                json_schema=KANA_SCHEMA,
+            )
+            kana = str(parse_json_object(raw_kana).get("kana") or "").strip()
         except Exception:
             log.exception("kana failed: %s", number)
             return
@@ -668,63 +734,93 @@ async def line_identity(pool: asyncpg.Pool) -> str:
     return f"名乗り: {got.get('self_label') or '(なし)'}\n名前を出してよい人: {names or '(なし)'}"
 
 
-# 会話監視の明示キャッシュ (2026-10-02)。通話ごとに 指示文 + 管制室の設定 + ワークスペース を登録し、
-# 相手が話すたびの呼び出しでは残り (メモ・吹き出し・文字起こし) だけを送る。
-# なぜ: 監視は相手の発話ごとに約 9,000 トークンを丸ごと送っていて、暗黙キャッシュは 3.8-flash では
-#   一度も当たらなかった (同じ前半を 2 秒おきに 4 回送って cached=0)。明示キャッシュなら
-#   ほぼ全部が cached になる (13,020/13,031)。中身は同じ文章を 2 つに分けて渡すだけ
-# ⚠作れなかったら (短すぎる・API の失敗) 従来どおり全部送る。費用が戻るだけで動きは変わらない
-_watch_cache: dict[str, tuple[int, str]] = {}  # call id → (前半の hash, "cachedContents/…" か "")
-WATCH_CACHE_TTL = "1800s"  # 通話より長く。終話を見たら消す (消し損ねても TTL で消える)
+WATCHER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ai_note": {"type": ["string", "null"]},
+        "fragments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "title": {"type": "string"},
+                    "text": {"type": "string"},
+                },
+                "required": ["kind", "title", "text"],
+            },
+        },
+        "handoff": {"type": "boolean"},
+        "handoff_reason": {"type": "string"},
+    },
+    "required": ["ai_note", "fragments", "handoff"],
+}
+
+# 会話監視のステートフル継続 (2026-11-13、Interactions API + gemini-4-hydrogen)。
+# Gemini 4 系は明示キャッシュ (cachedContents) 非対応の代わりに、Interactions API の
+# previous_interaction_id でサーバー側文脈を引き継ぐと、初回ターンで送ったワークスペース前半が
+# 2ターン目以降 約85% 暗黙キャッシュヒット (入力 95% 割引・保存料ゼロ) になる (AI Studio・Vertex とも実測確認)。
+# 終話時はサーバー上に残った interaction 履歴を裏スレッドで DELETE して掃除する。
+_watch_cache: dict[str, tuple[int, list[str]]] = {}  # call_id -> (前半の hash, [interaction_id, ...])
+WATCH_MAX_CHAIN = 12  # 長電話で履歴が膨らみすぎないよう一定ターンでチェーンを張り直す
 
 
-def _gemini_rest(method: str, path: str, body: dict | None = None, timeout: int = 30) -> dict:
+def _gemini_rest(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    timeout: int = 30,
+    *,
+    interactions: bool = False,
+) -> dict:
     req = urllib.request.Request(
         vertex.url(path),
         data=json.dumps(body).encode("utf-8") if body is not None else None,
         method=method,
-        headers=vertex.headers(),
+        headers=vertex.headers(interactions=interactions),
     )
     with urllib.request.urlopen(req, timeout=timeout) as res:
         raw = res.read()
     return json.loads(raw) if raw else {}
 
 
-def _watch_cache_for(call_key: str, prefix: str) -> str | None:
-    h = hash(prefix)
-    got = _watch_cache.get(call_key)
-    if got and got[0] == h:
-        return got[1] or None
-    if got:  # ワークスペースが変わった (電話帳の追記など) — 作り直す
-        _drop_watch_cache(call_key)
-    try:
-        c = _gemini_rest("POST", "cachedContents", {
-            "model": vertex.model_name(GEMINI_MODEL),
-            "systemInstruction": {"parts": [{"text": WATCHER_PROMPT}]},
-            "contents": [{"role": "user", "parts": [{"text": prefix}]}],
-            "ttl": WATCH_CACHE_TTL,
-        })
-    except Exception as e:
-        log.info("watch cache: 作れないので全部送る (%s)", str(e)[:120])
-        _watch_cache[call_key] = (h, "")
-        return None
-    name = c.get("name") or ""
-    _watch_cache[call_key] = (h, name)
-    log.info("watch cache: %s (%s tokens)", name, (c.get("usageMetadata") or {}).get("totalTokenCount"))
-    return name or None
+def _extract_interaction_text(res: dict) -> str:
+    if isinstance(res.get("output_text"), str) and res["output_text"].strip():
+        return res["output_text"].strip()
+    parts: list[str] = []
+    for st in res.get("steps") or []:
+        if st.get("type") in (None, "model_output"):
+            for c in st.get("content") or []:
+                if c.get("type") == "text" and c.get("text"):
+                    parts.append(c["text"])
+    for c in res.get("outputs") or []:
+        if c.get("type") == "text" and c.get("text"):
+            parts.append(c["text"])
+    return "".join(parts).strip()
+
+
+def _delete_interactions_bg(ids: list[str]) -> None:
+    if not ids:
+        return
+
+    def _run() -> None:
+        for iid in ids:
+            try:
+                _gemini_rest("DELETE", f"interactions/{iid}", timeout=15, interactions=True)
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _drop_watch_cache(call_key: str) -> None:
     got = _watch_cache.pop(call_key, None)
     if got and got[1]:
-        try:
-            _gemini_rest("DELETE", got[1])
-        except Exception:
-            pass  # TTL で消える
+        _delete_interactions_bg(list(got[1]))
 
 
 def drop_ended_watch_caches(active: set[str]) -> None:
-    for k in [k for k in _watch_cache if k not in active]:
+    for k in [k for k in list(_watch_cache) if k not in active]:
         _drop_watch_cache(k)
 
 
@@ -759,15 +855,57 @@ def make_watch_output(
         f"# 進行中の通話の文字起こし (相手番号: {caller or '不明'})\n{convo}\n\n"
         "指定のJSON形式で出力。"
     )
-    cache = _watch_cache_for(call_key, prefix) if call_key else None
-    if cache:
+    if call_key:
+        h = hash(prefix)
+        got = _watch_cache.get(call_key)
+        if got and (got[0] != h or len(got[1]) >= WATCH_MAX_CHAIN):
+            # ワークスペース更新または長電話の区切りでチェーンを張り直す
+            _drop_watch_cache(call_key)
+            got = None
+        prev_id = got[1][-1] if (got and got[1]) else None
+        resolved_model = vertex.resolve_model(HYDROGEN_MODEL)
+        ix_body: dict = {
+            "model": resolved_model,
+            "system_instruction": WATCHER_PROMPT,
+            "input": rest if prev_id else (prefix + rest),
+            "store": True,
+            "generation_config": {"thinking_level": "low"},
+            "response_format": {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": WATCHER_SCHEMA,
+            },
+        }
+        if prev_id:
+            ix_body["previous_interaction_id"] = prev_id
         try:
-            return call_gemini(WATCHER_PROMPT, rest, json_mode=True, cached=cache)
-        except urllib.error.HTTPError as e:
-            # キャッシュが消えていた等。次の発話で作り直す
-            log.info("watch cache: 使えなかった (%s) — 全部送る", e.code)
-            _watch_cache.pop(call_key, None)
-    return call_gemini(WATCHER_PROMPT, prefix + rest, json_mode=True)
+            res = _gemini_rest("POST", "interactions", ix_body, timeout=45, interactions=True)
+            out_txt = _extract_interaction_text(res)
+            if out_txt:
+                new_id = res.get("id") or ""
+                if new_id:
+                    chain = list(got[1]) if got else []
+                    chain.append(new_id)
+                    _watch_cache[call_key] = (h, chain)
+                u = res.get("usage") or {}
+                log.info(
+                    "gemini usage [watcher+ix/%s]: prompt=%s cached=%s out=%s",
+                    resolved_model,
+                    u.get("total_input_tokens"),
+                    u.get("total_cached_tokens", 0),
+                    (u.get("total_output_tokens") or 0) + (u.get("total_thought_tokens") or 0),
+                )
+                return out_txt
+        except Exception as e:
+            log.info("watch interaction: フォールバックへ切替 (%s)", str(e)[:140])
+            _drop_watch_cache(call_key)
+    return call_gemini(
+        WATCHER_PROMPT,
+        prefix + rest,
+        json_mode=True,
+        model=HYDROGEN_MODEL,
+        json_schema=WATCHER_SCHEMA,
+    )
 
 
 def urgent_allowed(number: str) -> bool:
@@ -820,10 +958,8 @@ async def watch_conversations(pool: asyncpg.Pool) -> None:
         "SELECT id, caller_number, room_name, answered_by FROM calls "
         "WHERE ended_at IS NULL AND started_at > now() - interval '2 hours'"
     )
-    if _watch_cache:  # 終わった通話の明示キャッシュを消す (保存料がかかるので TTL まで待たない)
-        await asyncio.get_running_loop().run_in_executor(
-            None, drop_ended_watch_caches, {str(c["id"]) for c in calls}
-        )
+    if _watch_cache:  # 終わった通話の interaction 履歴を裏スレッドで DELETE する
+        drop_ended_watch_caches({str(c["id"]) for c in calls})
     for c in calls:
         cid = str(c["id"])
         if cid not in _watch_seen:
@@ -1009,53 +1145,151 @@ async def write_call_transcript_md(pool: asyncpg.Pool, c) -> Path | None:
 
 
 REFINE_RECORDING_PROMPT = """あなたは電話の通話録音から文字起こしを清書する専門エディタです。
-添付されたステレオ音声（左チャンネル＝相手 caller、右チャンネル＝AI または 本人 user）と、
+添付された通話音声と、リアルタイム音声認識で作られた下書きセグメント一覧（JSON）を照合し、各セグメントの `text` を実際の音声に忠実で自然な日本語に修正してください。
+
+ルール:
+- 出力は入力と同じ `seq` を持つ JSON 配列 `[{"seq": 1, "text": "..."}, ...]` のみとする
+- `speaker` が `ai` または `whisper` のセグメントは、文脈の参照のみに使い、元の `text` をそのまま維持する
+- `speaker` が `caller` または `user` のセグメントは、録音音声を聴いて誤認識・聞き漏らし・文脈に合わない単語を正確に直す
+- リアルタイム認識で途中までしか拾えていない発話や、別の一言に化けている発話があれば、同じ発話ターン内で実際に話されている内容へ復元する
+- 電話の自動アナウンス（「お繋ぎいたします」「このままお待ちください」等）や環境ノイズが紛れ込んでいる場合は取り除く
+- 話していない内容を創作しない。自然な話し言葉と句読点（。、？）に整える"""
+
+# ⚠Gemini の音声入力は複数チャンネルのファイルを内部で 1 本のモノラルへ自動ダウンミックスする仕様のため、
+#   ステレオ Ogg をそのまま 1 ファイルで渡すと左右の話者分離が消えて相槌・被り発話が混ざる (2026-11-13 判明)。
+#   2ch ステレオ録音は ffmpeg で左(caller)・右(user/AI)の独立モノラル Opus 2 パートに分離して渡す。
+SPLIT_REFINE_RECORDING_PROMPT = """あなたは電話の通話録音から文字起こしを清書する専門エディタです。
+添付された2つの独立モノラル音声（1つ目＝相手 caller の左ch音声、2つ目＝AIまたは本人 user の右ch音声）と、
 リアルタイム音声認識で作られた下書きセグメント一覧（JSON）を照合し、各セグメントの `text` を実際の音声に忠実で自然な日本語に修正してください。
 
 ルール:
 - 出力は入力と同じ `seq` を持つ JSON 配列 `[{"seq": 1, "text": "..."}, ...]` のみとする
 - `speaker` が `ai` または `whisper` のセグメントは、文脈の参照のみに使い、元の `text` をそのまま維持する
-- `speaker` が `caller`（左ch）または `user`（右ch）のセグメントは、録音音声を聴いて誤認識・聞き漏らし・文脈に合わない単語を正確に直す
+- `speaker` が `caller` のセグメントは1つ目の音声のみ、`user` のセグメントは2つ目の音声のみを根拠に、誤認識・聞き漏らし・文脈に合わない単語を正確に直す（別チャンネルの相槌や発話を混ぜない）
 - リアルタイム認識で途中までしか拾えていない発話や、別の一言に化けている発話があれば、同じ発話ターン内で実際に話されている内容へ復元する
 - 電話の自動アナウンス（「お繋ぎいたします」「このままお待ちください」等）や環境ノイズが紛れ込んでいる場合は取り除く
 - 話していない内容を創作しない。自然な話し言葉と句読点（。、？）に整える"""
 
+REFINE_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "seq": {"type": "integer"},
+            "text": {"type": "string"},
+        },
+        "required": ["seq", "text"],
+    },
+}
+
+
+def _split_stereo_ogg_channels(ogg_bytes: bytes) -> tuple[bytes, bytes] | None:
+    """2ch 以上のステレオ Ogg を左(caller)・右(user/AI)のモノラル Opus バイト列に分離する。
+    モノラル録音 (1ch) や ffmpeg 未導入環境では None を返し、単一ファイル入力へフォールバックする。"""
+    try:
+        with tempfile.TemporaryDirectory(prefix="refine_ogg_") as td:
+            td_path = Path(td)
+            src = td_path / "in.ogg"
+            left = td_path / "left.ogg"
+            right = td_path / "right.ogg"
+            src.write_bytes(ogg_bytes)
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=channels",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(src),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if probe.returncode != 0 or int((probe.stdout or "0").strip() or "0") < 2:
+                return None
+            nice = ["nice", "-n", "19"] if os.name == "posix" else []
+            for ch_idx, dst in ((0, left), (1, right)):
+                r = subprocess.run(
+                    nice + [
+                        "ffmpeg", "-y", "-threads", "1", "-loglevel", "error", "-i", str(src),
+                        "-af", f"pan=mono|c0=c{ch_idx}",
+                        "-c:a", "libopus", "-b:a", "24k", "-application", "voip", str(dst),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if r.returncode != 0 or not dst.is_file() or dst.stat().st_size == 0:
+                    return None
+            return left.read_bytes(), right.read_bytes()
+    except Exception as e:
+        log.info("stereo ogg split skipped (単一ファイルで継続): %s", e)
+        return None
+
 
 def refine_recording_with_gemini(ogg_bytes: bytes, draft_segs: list[dict]) -> list[dict]:
-    b64 = base64.b64encode(ogg_bytes).decode("ascii")
     user_text = (
         "# リアルタイム文字起こし（下書き）\n"
         + json.dumps(draft_segs, ensure_ascii=False, indent=2)
         + "\n\n録音音声を聴いて、各セグメントの text を清書した JSON 配列のみを出力してください。"
     )
-    body = {
-        "system_instruction": {"parts": [{"text": REFINE_RECORDING_PROMPT}]},
-        "contents": [{
-            "role": "user",
-            "parts": [
-                {"inlineData": {"mimeType": "audio/ogg", "data": b64}},
-                {"text": user_text},
-            ],
-        }],
-        "generationConfig": {
-            "temperature": 0.1,
+    split_lr = _split_stereo_ogg_channels(ogg_bytes)
+    if split_lr is not None:
+        b64_left = base64.b64encode(split_lr[0]).decode("ascii")
+        b64_right = base64.b64encode(split_lr[1]).decode("ascii")
+        sys_prompt = SPLIT_REFINE_RECORDING_PROMPT
+        parts = [
+            {"text": "1つ目の音声（相手 caller チャンネル）:"},
+            {"inlineData": {"mimeType": "audio/ogg", "data": b64_left}},
+            {"text": "2つ目の音声（本人 user / AI チャンネル）:"},
+            {"inlineData": {"mimeType": "audio/ogg", "data": b64_right}},
+            {"text": user_text},
+        ]
+    else:
+        b64 = base64.b64encode(ogg_bytes).decode("ascii")
+        sys_prompt = REFINE_RECORDING_PROMPT
+        parts = [
+            {"inlineData": {"mimeType": "audio/ogg", "data": b64}},
+            {"text": user_text},
+        ]
+
+    def _body_for(target_model: str, with_schema: bool = True) -> dict:
+        gen_cfg: dict = {
             "responseMimeType": "application/json",
             "thinkingConfig": {"thinkingLevel": "low"},
-        },
-    }
+        }
+        if not vertex.is_gemini4(target_model):
+            gen_cfg["temperature"] = 0.1
+        if with_schema:
+            gen_cfg["responseJsonSchema"] = REFINE_SCHEMA
+        return {
+            "system_instruction": {"parts": [{"text": sys_prompt}]},
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": gen_cfg,
+        }
+
+    # 第一候補 PRO_MODEL (gemini-4-argon) → 失敗時は HYDROGEN_MODEL (gemini-4-hydrogen) → 最終 GEMINI_MODEL
+    # (3.8-flash は音声に無い文を補完しやすいため、まず Hydrogen へ逃がす)
     used_model = PRO_MODEL
     try:
-        data = _gemini_rest("POST", f"models/{PRO_MODEL}:generateContent", body, timeout=120)
+        data = _gemini_rest("POST", f"models/{PRO_MODEL}:generateContent", _body_for(PRO_MODEL), timeout=120)
     except Exception:
         time.sleep(2.0)
         try:
-            data = _gemini_rest("POST", f"models/{PRO_MODEL}:generateContent", body, timeout=120)
+            data = _gemini_rest("POST", f"models/{PRO_MODEL}:generateContent", _body_for(PRO_MODEL), timeout=120)
         except Exception:
-            used_model = GEMINI_MODEL
-            data = _gemini_rest("POST", f"models/{GEMINI_MODEL}:generateContent", body, timeout=120)
+            try:
+                used_model = HYDROGEN_MODEL
+                data = _gemini_rest(
+                    "POST", f"models/{HYDROGEN_MODEL}:generateContent", _body_for(HYDROGEN_MODEL), timeout=120
+                )
+            except Exception:
+                used_model = GEMINI_MODEL
+                data = _gemini_rest(
+                    "POST", f"models/{GEMINI_MODEL}:generateContent", _body_for(GEMINI_MODEL, with_schema=False), timeout=120
+                )
     u = data.get("usageMetadata") or {}
     log.info(
-        "gemini usage [refine_recording/%s]: prompt=%s out=%s",
+        "gemini usage [refine_recording%s/%s]: prompt=%s out=%s",
+        "+split" if split_lr is not None else "",
         vertex.resolve_model(used_model),
         u.get("promptTokenCount"),
         (u.get("candidatesTokenCount") or 0) + (u.get("thoughtsTokenCount") or 0),
@@ -1225,6 +1459,18 @@ def caller_label(number: str, org: str, person: str) -> str | None:
     return other_org[:60] or None
 
 
+CALL_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "caller_org": {"type": "string"},
+        "caller_person": {"type": "string"},
+        "lookup_conflict": {"type": "string"},
+    },
+    "required": ["summary", "caller_org", "caller_person", "lookup_conflict"],
+}
+
+
 async def summarize_call(pool: asyncpg.Pool, c) -> tuple[str, str, str, str]:
     """通話 1 本の (要約, 名乗った組織, 名乗った個人, 番号検索との食い違い)。
     ⚠infra/scripts/try_phonebook_update.py (テスト通話で電話帳の更新を試す外部の道具) からも呼ぶ"""
@@ -1239,18 +1485,23 @@ async def summarize_call(pool: asyncpg.Pool, c) -> tuple[str, str, str, str]:
         summary = "無言のまま切れた"
     else:
         convo = "\n".join(f"{SPEAKER_LABEL.get(s['speaker'], s['speaker'])}: {s['text']}" for s in segs)
+        prompt_text = (
+            f"# 発信者番号\n{c['caller_number']}\n\n"
+            f"# 番号検索の結果\n{_lookup_text(c['caller_number'] or '') or '(なし)'}\n\n"
+            f"# 文字起こし\n{convo}"
+        )
         try:
             out = await asyncio.get_running_loop().run_in_executor(
-                None, call_gemini, CALL_SUMMARY_PROMPT,
-                f"# 発信者番号\n{c['caller_number']}\n\n"
-                f"# 番号検索の結果\n{_lookup_text(c['caller_number'] or '') or '(なし)'}\n\n"
-                f"# 文字起こし\n{convo}",
-                True,
-                False,
                 None,
-                True,
+                lambda: call_gemini(
+                    CALL_SUMMARY_PROMPT,
+                    prompt_text,
+                    json_mode=True,
+                    model=HYDROGEN_MODEL,
+                    json_schema=CALL_SUMMARY_SCHEMA,
+                ),
             )
-            j = json.loads(out)
+            j = parse_json_object(out)
             summary = str(j.get("summary") or "").strip()[:200]
             org = str(j.get("caller_org") or "").strip()[:40]
             person = str(j.get("caller_person") or "").strip()[:40]
@@ -1349,7 +1600,7 @@ async def main() -> None:
         await asyncio.sleep(1)
 
 
-for _n in ("WATCHER_PROMPT", "LOOKUP_PROMPT", "DIGEST_PROMPT", "KANA_PROMPT", "CALL_SUMMARY_PROMPT"):
+for _n in ("SYSTEM_PROMPT", "WATCHER_PROMPT", "LOOKUP_PROMPT", "DIGEST_PROMPT", "KANA_PROMPT", "CALL_SUMMARY_PROMPT"):
     if _n in globals():
         _PROMPT_TAGS[globals()[_n]] = _n.removesuffix("_PROMPT").lower()
 

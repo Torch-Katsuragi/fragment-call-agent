@@ -43,12 +43,21 @@ _VERTEX_LATEST_MAP = {
     "gemini-pro-latest": "gemini-4-argon",
 }
 
+# Interactions API のレスポンス形式 (steps / usage) を AI Studio・Vertex AI 間で固定するヘッダ
+INTERACTIONS_API_REVISION = "2026-05-20"
+
 
 def resolve_model(model: str) -> str:
     """AI Studio では -latest エイリアスをそのまま使い、Vertex AI では明示モデルへ解決する"""
     if project():
         return _VERTEX_LATEST_MAP.get(model, model)
     return model
+
+
+def is_gemini4(model: str) -> bool:
+    """Gemini 4 系モデルか (temperature 非推奨・明示キャッシュ非対応・Vertex は global 限定)"""
+    resolved = _VERTEX_LATEST_MAP.get(model, model)
+    return resolved.startswith("gemini-4-")
 
 
 def token() -> str:
@@ -63,23 +72,37 @@ def token() -> str:
     return _token[0]
 
 
+def _vertex_host(loc: str) -> str:
+    return "aiplatform.googleapis.com" if loc == "global" else f"{loc}-aiplatform.googleapis.com"
+
+
 def url(path: str) -> str:
-    """REST の宛先。path は AI Studio の形 (models/<m>:generateContent / cachedContents) か、
+    """REST の宛先。path は AI Studio の形 (models/<m>:generateContent / cachedContents / interactions) か、
     Vertex のリソース名 (projects/... = キャッシュの名前) のどちらでもよい"""
     p = project()
     if not p:
         return f"https://generativelanguage.googleapis.com/v1beta/{path}"
     if path.startswith("projects/"):
         return f"https://aiplatform.googleapis.com/v1/{path}"
+    if path == "interactions" or path.startswith("interactions/"):
+        # Gemini 4 Interactions API は global エンドポイントで提供される (2026-11-13 実測)
+        return f"https://aiplatform.googleapis.com/v1/projects/{p}/locations/global/{path}"
+    loc = location()
     if path.startswith("models/"):
         rest = path[len("models/") :]
         if ":" in rest:
             m, action = rest.split(":", 1)
-            rest = f"{resolve_model(m)}:{action}"
+            resolved = resolve_model(m)
+            rest = f"{resolved}:{action}"
         else:
-            rest = resolve_model(rest)
+            resolved = resolve_model(rest)
+            rest = resolved
+        if is_gemini4(resolved):
+            # Gemini 4 系 (hydrogen / argon) はリージョン指定だと 404 になるため常に global へ送る
+            loc = "global"
         path = "publishers/google/models/" + rest
-    return f"https://aiplatform.googleapis.com/v1/projects/{p}/locations/{location()}/{path}"
+    host = _vertex_host(loc)
+    return f"https://{host}/v1/projects/{p}/locations/{loc}/{path}"
 
 
 def model_name(model: str) -> str:
@@ -90,10 +113,14 @@ def model_name(model: str) -> str:
     return f"projects/{p}/locations/{location()}/publishers/google/models/{resolve_model(model)}"
 
 
-def headers() -> dict[str, str]:
+def headers(*, interactions: bool = False) -> dict[str, str]:
     if project():
-        return {"Content-Type": "application/json", "Authorization": f"Bearer {token()}"}
-    return {"Content-Type": "application/json", "x-goog-api-key": os.environ.get("GOOGLE_API_KEY", "")}
+        h = {"Content-Type": "application/json", "Authorization": f"Bearer {token()}"}
+    else:
+        h = {"Content-Type": "application/json", "x-goog-api-key": os.environ.get("GOOGLE_API_KEY", "")}
+    if interactions:
+        h["Api-Revision"] = INTERACTIONS_API_REVISION
+    return h
 
 
 def available() -> bool:

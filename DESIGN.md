@@ -85,10 +85,10 @@ AI に戻すのは「AIに任せる」(AI 応答をオンにしてから抜け�
   ローカル向けの `Silero` と、PyTorch 不要でコールドスタートが速い軽量の `WebRTC VAD` (`LIVE_VAD=webrtc`) を選べる
 - **2段階マルチモーダル文字起こし補正**:
   1. **通話中の即時補正 (`agent`)** — Live API のストリーム文字起こしは固有名詞や数字が崩れやすいため、
-     発話区間ごとの WAV 音声と初期テキストを Gemini Flash に渡して数秒で補正し、`transcript_segments` を更新する
+     発話区間ごとの WAV 音声と初期テキストを Gemini 4 Hydrogen (`gemini-4-hydrogen`) に渡して数秒で補正し、`transcript_segments` を更新する
      (Android 側の interim 表示と二重にならないよう確定タイミングを揃える)
-  2. **終話後の全文清書 (`directory-agent`)** — 通話が終わると Asterisk の左右独立 WAV から作ったステレオ Ogg Opus
-     (左=相手、右=AI/本人) を Gemini Pro (`gemini-pro-latest` / Vertex AI では `gemini-4-argon`) に丸ごと聴かせ、
+  2. **終話後の全文清書 (`directory-agent`)** — 通話が終わるとステレオ Ogg Opus (左=相手、右=AI/本人) を `ffmpeg` で左右独立のモノラル音声 2 本に分離し
+     (Gemini の音声入力による自動モノラル混合を防ぐ)、Gemini Pro (`gemini-pro-latest` / Vertex AI では `gemini-4-argon`、失敗時は `gemini-4-hydrogen`) に聴かせて、
      会話全体の文脈を踏まえて全文を清書してから通話記録 Markdown と要約を更新する
 - **耳打ちと取り次ぎ** — 相手の発話中に届いた「後方支援メモ」と「耳打ち」は会話文脈にラベル付きで差し込む。
   相手が直接話したがり条件を満たせば端末を呼び出し、断られるか時間切れなら「つかまりませんでした」と伝えて用件を預かる
@@ -103,12 +103,12 @@ AI に戻すのは「AIに任せる」(AI 応答をオンにしてから抜け�
 ### directory-agent (ワークスペースの番人)
 
 - **下調べ**: 電話帳 (`連絡先/<番号>/<番号>.md` および担当者別の `<人>.md`) と過去の通話をまとめる
-- **番号検索**: 発信者番号を Google 検索付きの Gemini で調べ、事業者名と「通常 / 営業 / 詐欺 / 不明」を返す。
+- **番号検索**: 発信者番号を Google 検索付きの Gemini (`gemini-3.8-flash`) で調べ、事業者名と「通常 / 営業 / 詐欺 / 不明」を返す。
   営業・詐欺は明確な報告がある場合だけ (誤判定は正当な着信の自動拒否につながる)
-- **会話の見張り**: 相手の新しい発話があるたびに、応対者向けの吹き出しと、応対 AI 向けの後方支援メモを分けて出す。
+- **会話の見張り**: 相手の新しい発話があるたびに、`gemini-4-hydrogen` + Interactions API (`previous_interaction_id` による暗黙キャッシュ活用) で応対者向けの吹き出しと、応対 AI 向けの後方支援メモを分けて出す。
   吹き出しはメンバーしか見ないので【本人限定】の情報も書ける。応対 AI 向けのメモは開示の規則に従う
-- **録音圧縮と全文清書**: 生の WAV をステレオ Ogg Opus (`録音/YYYY-MM/...ogg`) に変換して元 WAV を消し、Gemini Pro で文字起こしを全文清書する。保存期間 (`RECORDING_RETENTION_DAYS` または管制室設定) に応じた自動削除も担う
-- **終話の要約と通話記録**: 通知・履歴用の要約 (`calls.summary_md`) と相手の呼び名 (`calls.caller_label`) を作り、ワークスペースの `通話記録/` に Markdown を書き出す
+- **録音圧縮と全文清書**: 生の WAV をステレオ Ogg Opus (`録音/YYYY-MM/...ogg`) に変換して元 WAV を消し、左右チャンネル分離のうえ Gemini Pro (`gemini-4-argon`) で文字起こしを全文清書する。保存期間 (`RECORDING_RETENTION_DAYS` または管制室設定) に応じた自動削除も担う
+- **終話の要約と通話記録**: `gemini-4-hydrogen` で通知・履歴用の要約 (`calls.summary_md`) と相手の呼び名 (`calls.caller_label`) を作り、ワークスペースの `通話記録/` に Markdown を書き出す
 
 ### 管制室 (Next.js)
 

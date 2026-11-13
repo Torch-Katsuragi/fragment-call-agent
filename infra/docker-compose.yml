@@ -124,6 +124,7 @@ services:
       #   (この日も踏んだ: FIXED_LINES_VIA_MODEL=1 を .env に足しただけでコンテナでは空だった)
       GEMINI_LIVE_MODEL: ${GEMINI_LIVE_MODEL:-gemini-3.8-live}
       GEMINI_TEXT_MODEL: ${GEMINI_TEXT_MODEL:-gemini-3.5-flash}
+      GEMINI_STT_REFINE_MODEL: ${GEMINI_STT_REFINE_MODEL:-gemini-4-hydrogen}
       FIXED_LINES_VIA_MODEL: ${FIXED_LINES_VIA_MODEL:-0}
       # live のターン検出: 相手の発話終了と見なすまでの沈黙 (ms)。3.8 は既定だと一拍で食い付く (2026-09-18)
       LIVE_END_SILENCE_MS: ${LIVE_END_SILENCE_MS:-800}
@@ -320,6 +321,9 @@ services:
       VERTEX_PROJECT: ${VERTEX_PROJECT:-}
       # サーバーでは agy (Antigravity CLI) を使えないので Gemini 直呼び固定 (2026-07-17実測)
       DIRECTORY_AGENT_BACKEND: gemini
+      DIRECTORY_AGENT_MODEL: ${DIRECTORY_AGENT_MODEL:-gemini-flash-latest}
+      DIRECTORY_AGENT_HYDROGEN_MODEL: ${DIRECTORY_AGENT_HYDROGEN_MODEL:-gemini-4-hydrogen}
+      DIRECTORY_AGENT_PRO_MODEL: ${DIRECTORY_AGENT_PRO_MODEL:-gemini-pro-latest}
       # ⚠時刻は JST で書く (2026-10-02)。worker は astimezone() でローカル時刻にするので、
       #   これが無いとコンテナの UTC になり、通話記録 md の見出し・電話帳の追記・AI に渡す
       #   過去の通話の時刻が 9 時間ずれていた。slim イメージに tzdata が無いので POSIX 形式で

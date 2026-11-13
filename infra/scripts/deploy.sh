@@ -67,7 +67,7 @@ if [ -z "$targets" ]; then
     # ⚠hookd.py と security.py は services/agent/ に置かれているが、動いているのは
     #   別コンテナ (infra-hookd-1)。agent だけ再起動して hookd が古いまま、を実際に踏んだ
     # ⚠hookd が import しているもの (presence.py は起動時に DDL を流す、push.py) も (2026-09-26 に列が入らず踏んだ)
-    case "$CHANGED" in *services/agent/hookd.py*|*services/agent/calld.py*|*services/agent/workspace_config.py*|*services/agent/security.py*|*services/agent/presence.py*|*services/agent/members.py*|*services/agent/push.py*|*services/agent/schedule.py*|*services/agent/requirements*.txt*|*services/agent/Dockerfile.hookd*|*infra/docker-compose.yml*) targets="$targets hookd";; esac
+    case "$CHANGED" in *services/agent/hookd.py*|*services/agent/calld.py*|*services/agent/vertex.py*|*services/agent/workspace_config.py*|*services/agent/security.py*|*services/agent/presence.py*|*services/agent/members.py*|*services/agent/push.py*|*services/agent/schedule.py*|*services/agent/requirements*.txt*|*services/agent/Dockerfile.hookd*|*infra/docker-compose.yml*) targets="$targets hookd";; esac
     case "$CHANGED" in *infra/asterisk/*) targets="$targets asterisk";; esac
     case "$CHANGED" in *services/directory-agent/*) targets="$targets worker";; esac
   fi

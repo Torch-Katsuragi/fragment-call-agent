@@ -21,21 +21,26 @@ from media_pipeline import _make_stt
 
 logger = logging.getLogger("call-agent")
 
-_REFINE_CLIENT = None
+_REFINE_CLIENTS: dict[str, object] = {}
 
 
-def _get_refine_client():
-    global _REFINE_CLIENT
-    if _REFINE_CLIENT is None:
-        from google import genai
+def _get_refine_client(model: str = ""):
+    from google import genai
 
-        p = vertex.project()
-        if p:
-            loc = os.environ.get("VERTEX_STT_REFINE_LOCATION") or vertex.location()
-            _REFINE_CLIENT = genai.Client(vertexai=True, project=p, location=loc)
+    p = vertex.project()
+    if p:
+        if vertex.is_gemini4(model):
+            # Gemini 4 系は Vertex AI の global エンドポイント限定 (リージョン指定は 404)
+            loc = os.environ.get("VERTEX_STT_REFINE_LOCATION") or "global"
         else:
-            _REFINE_CLIENT = genai.Client()
-    return _REFINE_CLIENT
+            loc = os.environ.get("VERTEX_STT_REFINE_LOCATION") or vertex.location()
+        key = f"vertex:{p}:{loc}"
+        if key not in _REFINE_CLIENTS:
+            _REFINE_CLIENTS[key] = genai.Client(vertexai=True, project=p, location=loc)
+        return _REFINE_CLIENTS[key]
+    if "aistudio" not in _REFINE_CLIENTS:
+        _REFINE_CLIENTS["aistudio"] = genai.Client()
+    return _REFINE_CLIENTS["aistudio"]
 
 
 def _pcm16k_to_wav(pcm: bytes, sr: int = 16000) -> bytes:
@@ -53,8 +58,8 @@ async def _refine_transcript_with_audio(
     raw_text: str,
     history: list[dict],
 ) -> str | None:
-    """発話区間の音声(WAV)と初回STTテキスト・直前の会話履歴を Gemini Flash (gemini-flash-latest /
-    Vertex 時は gemini-3.8-flash) に渡し、同音異義語や音素の誤認識を補正したテキストを返す。"""
+    """発話区間の音声(WAV)と初回STTテキスト・直前の会話履歴を Gemini 4 Hydrogen (失敗時は 3.8-flash)
+    に渡し、同音異義語や音素の誤認識を補正したテキストを返す。"""
     if not wav_bytes or len(wav_bytes) < 12844 or not raw_text.strip():
         return None
     try:
@@ -63,7 +68,6 @@ async def _refine_transcript_with_audio(
         pcm_arr = np.frombuffer(wav_bytes[44:], dtype=np.int16).astype(np.float32)
         if len(pcm_arr) < 6400 or float(np.sqrt(np.mean(pcm_arr ** 2))) < 60.0:
             return None
-        client = _get_refine_client()
         ctx_lines = [
             f"{'相手' if h['speaker'] == 'caller' else '本人' if h['speaker'] == 'user' else 'AI'}: {h['text']}"
             for h in history[-6:]
@@ -77,18 +81,24 @@ async def _refine_transcript_with_audio(
             "電話回線(8kHz)やマイクのノイズゲートで発話冒頭1〜2音が欠落して別単語に化けている箇所や、"
             "音声と照らし合わせて明確な音素の誤認識・同音異義語ミスがある箇所のみを本来の発話に修正してください）"
         )
-        raw_model = os.environ.get("GEMINI_STT_REFINE_MODEL", "gemini-flash-latest")
+        # 2026-11-13 実測: gemini-4-hydrogen(low) は 3.8-flash(low) より応答ばらつきが小さく
+        # (3.39〜3.42s vs 3.73〜6.00s)、勝手に前後の文を創作するハルシネーションも起きないため既定化
+        raw_model = os.environ.get("GEMINI_STT_REFINE_MODEL", "gemini-4-hydrogen")
         model_name = vertex.resolve_model(raw_model)
         contents = [
             genai_types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
             prompt,
         ]
-        cfg = genai_types.GenerateContentConfig(
-            temperature=0.1,
-            # ⚠3.8-flash 以降は minimal 非対応 (400 INVALID_ARGUMENT) のため low で統一 (2026-11-09実測)
-            thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
-        )
+        # ⚠3.8-flash 以降は minimal 非対応 (400 INVALID_ARGUMENT) のため low で統一。
+        #   Gemini 4 系は temperature 非推奨のため指定しない (2026-11-13)
+        cfg_kwargs: dict = {
+            "thinking_config": genai_types.ThinkingConfig(thinking_level="low"),
+        }
+        if not vertex.is_gemini4(model_name):
+            cfg_kwargs["temperature"] = 0.1
+        cfg = genai_types.GenerateContentConfig(**cfg_kwargs)
         try:
+            client = _get_refine_client(model_name)
             resp = await asyncio.wait_for(
                 client.aio.models.generate_content(
                     model=model_name,
@@ -100,11 +110,16 @@ async def _refine_transcript_with_audio(
         except Exception:
             if model_name == "gemini-3.8-flash":
                 raise
+            fb_client = _get_refine_client("gemini-3.8-flash")
+            fb_cfg = genai_types.GenerateContentConfig(
+                temperature=0.1,
+                thinking_config=genai_types.ThinkingConfig(thinking_level="low"),
+            )
             resp = await asyncio.wait_for(
-                client.aio.models.generate_content(
+                fb_client.aio.models.generate_content(
                     model="gemini-3.8-flash",
                     contents=contents,
-                    config=cfg,
+                    config=fb_cfg,
                 ),
                 timeout=8.0,
             )
