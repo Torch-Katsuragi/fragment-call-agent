@@ -6,7 +6,8 @@ import { FRAGMENT_WORKSPACE } from "./env";
 //   連絡先/<番号>/<番号>.md … 番号の基本情報 (持ち主の名前・メモ・番号検索・最近の用件)
 //   連絡先/<番号>/<人>.md   … 組織の番号からかけてくる個人ごと
 // 書き手の決まり・節の意味は services/directory-agent/phonebook.py の冒頭 (連絡先/連絡先.md にも同じもの)。
-// ⚠管制室が書くのは名前・読みがな (スマホの電話帳から登録)・緊急呼び出しの許可だけ。ほかは worker
+// ⚠管制室が書くのは名前・読みがな・メモ (「## メモ」節のみ)・相手ごとの応答・緊急呼び出しの許可だけ。
+//   「（自動）」付きの節は worker の領域なので触らない。
 // ⚠旧形式 (連絡先/<番号>.md) も読む。書くときに新しい形へ移す
 // dashboard はワークスペースを直接読み書きする (VM では rclone bisync で Drive と同期、5 分おき)。
 // 名前の解決は 30 秒キャッシュ
@@ -37,7 +38,7 @@ export function contactFileForWrite(number: string): string {
   if (fs.existsSync(old)) {
     let md = fs.readFileSync(old, "utf-8");
     for (const t of ["番号検索", "最近の用件", "話した人", "未整理", "食い違い"]) {
-      md = md.replace(new RegExp(`^## ${t}[ \\t]*$`, "gm"), `## ${t}（自動）`);
+      md = md.replace(new RegExp(`^## ${t}[ \\t]*\\r?$`, "gm"), `## ${t}（自動）`);
     }
     fs.writeFileSync(neu, md, "utf-8");
     fs.unlinkSync(old);
@@ -67,7 +68,7 @@ function kanaOf(md: string): string | null {
 /** 「## <見出し>」の節の中身。機械の節は「（自動）」付きでも同じ節として読む */
 function sectionOf(md: string, heading: string): string {
   const m = md.match(
-    new RegExp(`^## ${heading}(?:（自動）)?[ \\t]*\\n([\\s\\S]*?)(?=^## |(?![\\s\\S]))`, "m"),
+    new RegExp(`^## ${heading}(?:（自動）)?[ \\t]*\\r?\\n([\\s\\S]*?)(?=^## |(?![\\s\\S]))`, "m"),
   );
   return (m ? m[1] : "").trim();
 }
@@ -97,17 +98,22 @@ export function phonebookName(number: string | null): string | null {
 // people = 話した人 (組織の番号からかけてきた個人)。人のファイルから「### 名前」+ 用件の行で組み立てる
 // unsorted = 「## 未整理」(同じ人か迷って振り分けなかった名乗り)
 // conflicts = 「## 食い違い」(番号検索や登録済みの名前と、通話での名乗りが違った記録)
+export type ContactUrgent = "allowed" | "denied" | "unset";
+
 export type Contact = {
   number: string;
   name: string | null;
   kana: string | null;
   memo: string;
+  recent: string;
   lookup: string;
   people: string;
   unsorted: string;
   conflicts: string;
   /** 相手ごとの応答 (2026-09-30)。null = 回線の設定に従う */
   answer: ContactAnswer | null;
+  /** 緊急呼び出しの許可状態 */
+  urgent: ContactUrgent;
 };
 
 // 相手ごとの応答。判定は hookd (services/agent/schedule.py の contact_answer)。⚠値の文字列を揃えること
@@ -119,13 +125,19 @@ function answerOf(md: string): ContactAnswer | null {
   return (CONTACT_ANSWERS as readonly string[]).includes(v ?? "") ? (v as ContactAnswer) : null;
 }
 
+function urgentOf(md: string): ContactUrgent {
+  const m = md.match(/^緊急呼び出し:\s*(\S+)\s*$/m);
+  if (!m) return "unset";
+  return /^(true|yes|はい)$/i.test(m[1]) ? "allowed" : "denied";
+}
+
 /** 相手ごとの応答を書く。null で消す (回線の設定に従う)。⚠人が決める値 — 機械は書かない */
 export function setContactAnswer(number: string, answer: ContactAnswer | null): void {
-  const file = contactFile(number);
-  if (!file) throw new Error("電話帳にない番号です");
+  if (!contactFile(number)) throw new Error("電話帳にない番号です");
+  const file = contactFileForWrite(number);
   const md = fs.readFileSync(file, "utf-8");
   let next = md.replace(/^応答:.*\r?\n/m, "");
-  if (answer) next = next.replace(/^---\r?\n/, `---\n応答: ${answer}\n`);
+  if (answer) next = next.replace(/^---\r?\n/, () => `---\n応答: ${answer}\n`);
   if (next !== md) fs.writeFileSync(file, next, "utf-8");
   cache.delete(number);
 }
@@ -174,17 +186,90 @@ export function listPhonebook(): Contact[] {
         name: nameOf(md),
         kana: kanaOf(md),
         memo: memoOf(md),
+        recent: sectionOf(md, "最近の用件"),
         lookup: sectionOf(md, "番号検索"),
         people: peopleOf(number),
         unsorted: sectionOf(md, "未整理"),
         conflicts: sectionOf(md, "食い違い"),
         answer: answerOf(md),
+        urgent: urgentOf(md),
       });
     } catch {
       /* 読めないファイルは飛ばす */
     }
   }
   return out;
+}
+
+const MEMO_PLACEHOLDER = "(まだ情報なし。名前・関係・話し方の注意などをここに書く)";
+
+function replaceMemoSection(md: string, rawMemo: string): string {
+  const cleaned = rawMemo
+    .replace(/\r\n/g, "\n")
+    .replace(/^## (?=\S)/gm, "### ")
+    .trim()
+    .slice(0, 4000);
+  const body = cleaned || MEMO_PLACEHOLDER;
+  const block = `## メモ\n\n${body}\n\n`;
+  const re = /^## メモ(?:（自動）)?[ \t]*\r?\n[\s\S]*?(?=^## |(?![\s\S]))/m;
+  if (re.test(md)) {
+    return md.replace(re, () => block);
+  }
+  const firstSec = md.search(/^## /m);
+  if (firstSec >= 0) {
+    return md.slice(0, firstSec) + block + md.slice(firstSec);
+  }
+  return md.replace(/\s*$/, "\n\n") + block;
+}
+
+/**
+ * 管制室の電話帳画面から 1 件を新規作成・編集する (2026-11-14)。
+ * 触るのは frontmatter の name / kana と「## メモ」節のみ。機械の「（自動）」節はそのまま保つ。
+ * 人が名前を指定した場合は name_source を外す (= 以後 worker は名前を上書きしない)。
+ */
+export function saveContactDetails(
+  number: string,
+  opts: { name?: string | null; kana?: string | null; memo?: string | null },
+): { created: boolean } {
+  const existed = contactFile(number) !== null;
+  const file = contactFileForWrite(number);
+  const oneLine = (s: string) => s.replace(/[\r\n"]/g, " ").trim().slice(0, 60);
+
+  let md: string;
+  if (existed && fs.existsSync(file)) {
+    md = fs.readFileSync(file, "utf-8");
+  } else {
+    md =
+      `---\nnumber: "${number}"\nname: 不明\ntags: [フラグメント, 電話帳]\n---\n\n# ${number}\n\n` +
+      `## メモ\n\n${MEMO_PLACEHOLDER}\n\n## 最近の用件（自動）\n\n`;
+  }
+
+  if (opts.name !== undefined) {
+    const cleanName = oneLine(opts.name ?? "") || "不明";
+    md = /^name:.*$/m.test(md)
+      ? md.replace(/^name:.*$/m, () => `name: ${cleanName}`)
+      : md.replace(/^---\r?\n/, () => `---\nname: ${cleanName}\n`);
+    md = md.replace(/^name_source:.*\r?\n/m, "");
+  }
+
+  if (opts.kana !== undefined) {
+    const cleanKana = oneLine(opts.kana ?? "");
+    if (cleanKana) {
+      md = /^kana:.*$/m.test(md)
+        ? md.replace(/^kana:.*$/m, () => `kana: ${cleanKana}`)
+        : md.replace(/^(name:.*)$/m, (m) => `${m}\nkana: ${cleanKana}`);
+    } else {
+      md = md.replace(/^kana:.*\r?\n/m, "");
+    }
+  }
+
+  if (opts.memo !== undefined) {
+    md = replaceMemoSection(md, opts.memo ?? "");
+  }
+
+  fs.writeFileSync(file, md, "utf-8");
+  cache.delete(number);
+  return { created: !existed };
 }
 
 /**
@@ -202,22 +287,22 @@ export function upsertContact(number: string, name: string, kana?: string | null
   if (existed) {
     const md = fs.readFileSync(file, "utf-8");
     let next = /^name:.*$/m.test(md)
-      ? md.replace(/^name:.*$/m, `name: ${clean}`)
-      : md.replace(/^---\r?\n/, `---\nname: ${clean}\n`);
+      ? md.replace(/^name:.*$/m, () => `name: ${clean}`)
+      : md.replace(/^---\r?\n/, () => `---\nname: ${clean}\n`);
     next = next.replace(/^name_source:.*\r?\n/m, "");
     // 読みがなはスマホの連絡先に付いていたときだけ書く (無ければ既存のものを残す。
     // 無いままのものは worker が名前から補う)
     if (k) {
       next = /^kana:.*$/m.test(next)
-        ? next.replace(/^kana:.*$/m, `kana: ${k}`)
-        : next.replace(/^(name:.*)$/m, `$1\nkana: ${k}`);
+        ? next.replace(/^kana:.*$/m, () => `kana: ${k}`)
+        : next.replace(/^(name:.*)$/m, (m) => `${m}\nkana: ${k}`);
     }
     if (next !== md) fs.writeFileSync(file, next, "utf-8");
   } else {
     fs.writeFileSync(
       file,
       `---\nnumber: "${number}"\nname: ${clean}\n${k ? `kana: ${k}\n` : ""}tags: [フラグメント, 電話帳]\n---\n\n# ${number}\n\n` +
-        `## メモ\n\n(まだ情報なし。名前・関係・話し方の注意などをここに書く)\n\n## 最近の用件（自動）\n\n`,
+        `## メモ\n\n${MEMO_PLACEHOLDER}\n\n## 最近の用件（自動）\n\n`,
       "utf-8",
     );
   }

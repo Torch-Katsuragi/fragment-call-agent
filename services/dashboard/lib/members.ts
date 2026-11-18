@@ -217,8 +217,10 @@ export function memberFromHeaders(h: { get(name: string): string | null }): {
   name: string;
   email: string;
 } | null {
-  const id = Number(h.get("x-member-id") ?? "");
-  if (!id) return null;
+  const raw = h.get("x-member-id");
+  if (raw === null || raw === "") return null;
+  const id = Number(raw);
+  if (!Number.isFinite(id)) return null;
   return {
     id,
     role: h.get("x-member-role") ?? "",

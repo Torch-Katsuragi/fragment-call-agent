@@ -89,6 +89,11 @@ export default function Sidebar({ footer }: { footer?: React.ReactNode }) {
       <Link href="/">
         <div className="side-title">🧩 フラグメント</div>
       </Link>
+      <Link href="/phonebook">
+        <div className={`side-item ${pathname.startsWith("/phonebook") ? "current" : ""}`}>
+          <span className="side-label">📇 電話帳</span>
+        </div>
+      </Link>
       <Link href="/security">
         <div className={`side-item ${pathname === "/security" ? "current" : ""}`}>
           <span className="side-label">🛡 警備</span>

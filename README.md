@@ -59,7 +59,7 @@
 | calld | `services/agent/calld.py` | Cloud Run HTTP モード時のディスパッチ・先行ウォームアップ・世代トークン (`agent_lease`) 死活監視 |
 | hookd | `services/agent/hookd.py` | ダイヤルプランと端末から叩かれる API。警備 (`security.py`)、時間割判定 (`schedule.py`)、FCM プッシュ |
 | directory-agent | `services/directory-agent/worker.py` | ワークスペースの番人。下調べ・番号検索・吹き出し・ステレオ Ogg 変換・全文清書・要約 |
-| 管制室 | `services/dashboard/` | Web UI。着信バナー、ライブ通話画面、履歴・録音再生、メンバー招待・時間割・設定 |
+| 管制室 | `services/dashboard/` | Web UI。着信バナー、ライブ通話画面、電話帳の閲覧・編集、履歴・録音再生、メンバー招待・時間割・設定 |
 | Android アプリ | `clients/android/` | 子機。Google ログインで参加し、着信・取り次ぎ・保留転送・通話・発信を担う |
 
 ## 必要なもの

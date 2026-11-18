@@ -155,7 +155,7 @@ if [ \"\$t\" != \"\${t/ dashboard /}\" ]; then
   echo '--- dashboard: 依存 + ビルド + 再起動 ---'
   # ⚠install を忘れると package.json に依存を足したデプロイでビルドが壊れる
   #   (qrcode 追加 2026-08-01 が最初の該当)。依存に変化が無ければ一瞬で終わる
-  (cd services/dashboard && npm install --no-audit --no-fund 2>&1 | tail -1 && npm run build 2>&1 | tail -3)
+  (cd services/dashboard && npm install --no-audit --no-fund 2>&1 | tail -1 && NODE_OPTIONS='--max-old-space-size=1024' npm run build 2>&1 | tail -5)
   # 管制室の systemd ユニットを再起動する
   units=\$(systemctl list-units --all --plain --no-legend 'call-agent-dashboard*' | awk '{print \$1}')
   sudo systemctl restart \$units

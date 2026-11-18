@@ -1,16 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pool } from "@/lib/db";
+import { memberFromHeaders } from "@/lib/members";
 import { listPhonebook, normalizeNumber, upsertContact } from "@/lib/phonebook";
 
 export const dynamic = "force-dynamic";
 
-// 電話帳 (2026-09-26、アプリの電話帳タブ)。実体はワークスペースの 連絡先/<番号>.md (lib/phonebook.ts)。
+// 電話帳 (2026-09-26 アプリの電話帳タブ、2026-11-14 PC 管制室の電話帳画面と共用)。
+// 実体はワークスペースの 連絡先/<番号>/<番号>.md (lib/phonebook.ts)。
 // GET  … 全件 + 通話の回数と最後の通話 (名前のある相手が先、あとは最後の通話が新しい順)
 // POST … スマホの電話帳から選んだ相手を登録する {contacts: [{name, kana?, numbers: [...]}]}
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const me = memberFromHeaders(req.headers);
   // ⚠初めての相手からの着信で worker が雛形を自動で作る (名前「不明」・メモ空)。
-  //   それは電話帳というより通話の跡なので出さない。名前かメモのどちらかが入ったら出る
-  const contacts = listPhonebook().filter((c) => c.name || c.memo);
+  //   それは電話帳というより通話の跡なので出さない。名前・メモ・応答上書き・緊急許可・人別の記録があれば出す
+  const contacts = listPhonebook().filter(
+    (c) => c.name || c.memo || c.answer || c.urgent === "allowed" || c.people || c.conflicts,
+  );
   const stats = new Map<string, { count: number; last: string; lastId: string }>();
   if (contacts.length > 0) {
     try {
@@ -44,7 +49,7 @@ export async function GET() {
     if (a.name && b.name) return (a.kana ?? a.name).localeCompare(b.kana ?? b.name, "ja");
     return (b.last_call_at ?? "").localeCompare(a.last_call_at ?? "");
   });
-  return NextResponse.json({ contacts: out });
+  return NextResponse.json({ contacts: out, role: me?.role ?? "viewer" });
 }
 
 export async function POST(req: NextRequest) {

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pool } from "@/lib/db";
 import { deviceFrom } from "@/lib/device";
+import { memberFromHeaders } from "@/lib/members";
 
 export const dynamic = "force-dynamic";
 
@@ -26,12 +27,13 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "通話中ではありません" }, { status: 409 });
   }
   const dev = deviceFrom(req);
+  const me = memberFromHeaders(req.headers);
   const q = new URLSearchParams({
     room: r.rows[0].room_name,
     number: r.rows[0].caller_number ?? "",
     reason: "保留中の通話",
     manual: "1",
-    by: dev?.name || "管制室",
+    by: dev?.name || me?.name || "管制室",
     targets: targets.join(","),
   });
   try {

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { FRAGMENT_WORKSPACE } from "./env";
-import { contactFile, contactFileForWrite } from "./phonebook";
+import { contactFile, contactFileForWrite, isNumber } from "./phonebook";
 
 // 「緊急呼び出しを許可した相手」の台帳。実体は電話帳md
 // (フラグメント/連絡先/<番号>/<番号>.md) の frontmatter にある `緊急呼び出し` プロパティ。
@@ -34,7 +34,7 @@ function mdPath(number: string): string {
 }
 
 function isValid(number: string): boolean {
-  return /^[0-9]{4,20}$/.test(number);
+  return isNumber(number);
 }
 
 /** 電話帳mdから許可状態を読む。mdが無い/プロパティが無いなら unset */
@@ -66,13 +66,13 @@ export function setUrgentState(number: string, allowed: boolean): void {
     fs.mkdirSync(path.dirname(p), { recursive: true });
     md = `---\nnumber: "${number}"\nname: 不明\ntags: [フラグメント, 電話帳]\n---\n\n# ${number}\n`;
   }
-  const re = new RegExp(`^${FLAG}:.*$`, "m");
+  const re = new RegExp(`^${FLAG}:.*\\r?$`, "m");
   if (re.test(md)) {
-    md = md.replace(re, line);
-  } else if (md.startsWith("---\n")) {
+    md = md.replace(re, () => line);
+  } else if (/^---\r?\n/.test(md)) {
     // frontmatterの閉じ `---` の直前に差し込む
-    const end = md.indexOf("\n---", 4);
-    md = end < 0 ? `---\n${line}\n${md.slice(4)}` : md.slice(0, end + 1) + line + "\n" + md.slice(end + 1);
+    const end = md.indexOf("\n---", 3);
+    md = end < 0 ? md.replace(/^---\r?\n/, () => `---\n${line}\n`) : md.slice(0, end + 1) + line + "\n" + md.slice(end + 1);
   } else {
     md = `---\nnumber: "${number}"\n${line}\n---\n\n${md}`;
   }

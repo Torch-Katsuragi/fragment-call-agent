@@ -356,16 +356,47 @@
   }
   /* ⚠スマホ用の「ボタンは高さ 44px 以上」がスイッチにも掛かって丸く潰れていた (2026-09-24 実機)。
      スイッチは形が意味なので寸法を固定する。指で押しやすいよう少しだけ大きく */
-  .set-row .switch {
+  .set-row .switch,
+  .pb-ctl-row .switch {
     min-height: 0;
     width: 52px;
     height: 30px;
   }
-  .set-row .switch::after {
+  .set-row .switch::after,
+  .pb-ctl-row .switch::after {
     width: 24px;
     height: 24px;
   }
-  .set-row .switch.on::after {
+  .set-row .switch.on::after,
+  .pb-ctl-row .switch.on::after {
     left: 25px;
+  }
+
+  /* 電話帳 (/phonebook): 見出し行は横並びを維持し、展開中身は左インデントを外す */
+  .set-row.pb-row {
+    display: flex;
+    align-items: center;
+  }
+  .set-row.pb-row > * + * {
+    margin-top: 0;
+  }
+  .pb-detail {
+    padding: 0 14px 16px;
+  }
+  .pb-ctl-row {
+    flex-wrap: wrap;
+  }
+  .pb-ctl-row .segmented {
+    display: flex;
+    width: 100%;
+  }
+  .pb-ctl-row .segmented-btn {
+    flex: 1;
+    min-height: 44px;
+  }
+  .pb-field input,
+  .pb-search-input {
+    font-size: 16px;
+    min-height: 44px;
   }
 }

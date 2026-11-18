@@ -67,6 +67,8 @@ export default function CallView({
   const [error, setError] = useState<string | null>(null);
   // 送信済みでまだDBに現れていない耳打ち (楽観表示)
   const [pendingWhispers, setPendingWhispers] = useState<string[]>([]);
+  const [calloutOpen, setCalloutOpen] = useState(false);
+  const [calloutNote, setCalloutNote] = useState<string | null>(null);
 
   const active = call?.ended_at === null;
   // この通話がグローバル接続中のアクティブ通話か (LiveKitフックはこの時だけ使える)
@@ -192,10 +194,14 @@ export default function CallView({
           </div>
         )}
         <FragmentsPanel items={call.fragments ?? []} />
+        {calloutNote && <div className="callout-toast">🔔 {calloutNote}</div>}
         {isLive && (
           <CallBar
             operator={cs.operator}
             onHold={call.handler === "human" ? cs.leaveToHold : undefined}
+            onCallout={
+              !cs.operator && call.handler === "hold" ? () => setCalloutOpen(true) : undefined
+            }
             onAiFromHold={
               !cs.operator && call.handler === "hold"
                 ? () =>
@@ -208,6 +214,17 @@ export default function CallView({
             }
             onSwitch={cs.toggleOperator}
             onHangup={hangup}
+          />
+        )}
+        {calloutOpen && active && (
+          <CalloutModal
+            callId={id}
+            onClose={() => setCalloutOpen(false)}
+            onCalled={(who) => {
+              setCalloutOpen(false);
+              setCalloutNote(`${who}の端末を鳴らしています…`);
+              setTimeout(() => setCalloutNote(null), 8000);
+            }}
           />
         )}
       </div>
@@ -235,6 +252,7 @@ function Elapsed({ since }: { since: string }) {
 function CallBar({
   operator,
   onHold,
+  onCallout,
   onAiFromHold,
   onSwitch,
   onHangup,
@@ -242,6 +260,8 @@ function CallBar({
   operator: boolean;
   /** 会話から抜けて保留にする (自分が会話中のときだけ) */
   onHold?: () => void;
+  /** 保留中に特定のメンバー (または全員) の端末を鳴らす */
+  onCallout?: () => void;
   /** 保留中の通話を AI に渡す (自分が会話していないとき) */
   onAiFromHold?: () => void;
   onSwitch: () => void;
@@ -296,6 +316,11 @@ function CallBar({
       <button className={`bar-btn switch ${operator ? "to-ai" : "to-me"}`} onClick={onSwitch}>
         {operator ? "🤖 AIに任せる" : "🎙 自分が出る"}
       </button>
+      {onCallout && (
+        <button className="bar-btn" onClick={onCallout} title="他のメンバーのスマホを鳴らして呼び出します">
+          🔔 呼ぶ
+        </button>
+      )}
       {onAiFromHold && (
         <button className="bar-btn switch to-ai" onClick={onAiFromHold}>
           🤖 AIに任せる
@@ -305,6 +330,109 @@ function CallBar({
       <button className="bar-btn danger" onClick={onHangup}>
         📞 通話終了
       </button>
+    </div>
+  );
+}
+
+type Candidate = { id: string; name: string; role: string; reason: string };
+
+function CalloutModal({
+  callId,
+  onClose,
+  onCalled,
+}: {
+  callId: string;
+  onClose: () => void;
+  onCalled: (who: string) => void;
+}) {
+  const [list, setList] = useState<Candidate[] | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [sending, setSending] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    fetch(`/api/calls/${callId}/candidates`, { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error())))
+      .then((d) => {
+        if (alive) setList(d.candidates ?? []);
+      })
+      .catch(() => {
+        if (alive) setFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [callId]);
+
+  const ring = async (targets: string[], who: string) => {
+    setSending(true);
+    try {
+      const res = await fetch(`/api/calls/${callId}/callout`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targets }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        window.alert(d.error ?? "呼び出せませんでした");
+        return;
+      }
+      onCalled(who);
+    } catch {
+      window.alert("呼び出せませんでした");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="callout-backdrop" onClick={onClose}>
+      <div className="panel callout-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="callout-title">誰を呼びますか</div>
+        {failed && <div className="muted">候補を読み込めませんでした。</div>}
+        {!failed && list === null && <div className="muted">会話の流れから候補を並べています…</div>}
+        {!failed && list !== null && list.length === 0 && (
+          <div className="muted">呼べるスマホ端末がありません（アプリにログイン済みの端末が対象です）。</div>
+        )}
+        {!failed && list !== null && list.length > 0 && (
+          <div className="callout-list">
+            {list.map((cand) => {
+              const sub = cand.reason || cand.role;
+              return (
+                <button
+                  key={cand.id}
+                  type="button"
+                  className="callout-item"
+                  disabled={sending}
+                  onClick={() => ring([cand.id], cand.name)}
+                >
+                  <div className="account-avatar account-avatar-fallback">
+                    {(cand.name || "?").charAt(0)}
+                  </div>
+                  <div className="callout-item-text">
+                    <div className="callout-item-name">{cand.name}</div>
+                    {sub && (
+                      <div className={cand.reason ? "callout-item-reason" : "set-row-desc"}>
+                        {sub}
+                      </div>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+        <div className="callout-foot">
+          {list && list.length > 0 && (
+            <button type="button" disabled={sending} onClick={() => ring([], "全員")}>
+              全員を呼ぶ
+            </button>
+          )}
+          <button type="button" className="btn-quiet" onClick={onClose} disabled={sending}>
+            やめる
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
